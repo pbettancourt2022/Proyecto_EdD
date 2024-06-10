@@ -90,15 +90,3 @@ public:
         return decodedString;
     }
 };
-
-int main() {
-    HuffmanCoding hc;
-    std::string text = "tangananica-tanganana";
-    std::string encoded = hc.codificar(text);
-    std::cout << "Encoded: " << encoded << std::endl;
-
-    std::string decoded = hc.decodificar(encoded);
-    std::cout << "Decoded: " << decoded << std::endl;
-
-    return 0;
-}
