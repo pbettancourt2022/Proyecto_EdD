@@ -1,73 +1,82 @@
 #include <iostream>
-#include <string>
 #include <vector>
+#include <string>
 #include <unordered_map>
-#include <memory>
+#include <bitset>
 
+using namespace std;
 
-struct Pair {
-    int position;
-    int length;
-    char nextChar;
+typedef pair<int, int> Pair;
 
-    Pair(int p, int l, char c) : position(p), length(l), nextChar(c) {}
-};
+// Función para encontrar la coincidencia más larga del substring en la ventana
+Pair findLongestMatch(const string &s, int currentPosition) {
+    int maxMatchLength = 0;
+    int matchPosition = 0;
 
-class LZCompression {
-public:
-    std::vector<Pair> comprimir(const std::string& text) {
-        std::vector<Pair> compressed;
-        std::unordered_map<std::string, int> dictionary;
-        int i = 0;
+    // Ventana deslizante para encontrar la coincidencia más larga
+    for (int i = 0; i < currentPosition; ++i) {
+        int length = 0;
+        while (s[i + length] == s[currentPosition + length] && (currentPosition + length) < s.size()) {
+            ++length;
+        }
+        if (length > maxMatchLength) {
+            maxMatchLength = length;
+            matchPosition = i;
+        }
+    }
+    return {matchPosition, maxMatchLength};
+}
 
-        while (i < text.size()) {
-            int maxLength = 0;
-            int maxPos = -1;
-            char nextChar = '\0';
+// Comprimir el texto usando compresión LZ
+vector<Pair> compress(const string &t) {
+    vector<Pair> compressed;
+    int i = 0;
+    
+    while (i < t.size()) {
+        Pair match = findLongestMatch(t, i);
+        
+        if (match.second > 0) {
+            compressed.push_back(match);
+            i += match.second;
+        } else {
+            compressed.push_back({t[i], 0});
+            ++i;
+        }
+    }
+    
+    return compressed;
+}
 
-            for (int length = 1; length <= text.size() - i; ++length) {
-                std::string substring = text.substr(i, length);
-                auto it = dictionary.find(substring);
-                if (it != dictionary.end()) {
-                    maxLength = length;
-                    maxPos = it->second;
-                } else {
-                    break;
-                }
-            }
-
-            if (maxLength > 0) {
-                if (i + maxLength < text.size()) {
-                    nextChar = text[i + maxLength];
-                }
-                compressed.push_back(Pair(i - maxPos, maxLength, nextChar));
-                dictionary[text.substr(i, maxLength + 1)] = i;
-                i += maxLength + 1;
-            } else {
-                compressed.push_back(Pair(-1, 0, text[i]));
-                dictionary[text.substr(i, 1)] = i;
-                ++i;
+// Descomprimir la secuencia de pares para obtener el texto original
+string decompress(const vector<Pair> &c) {
+    string decompressed;
+    
+    for (const Pair &p : c) {
+        if (p.second == 0) {
+            decompressed += char(p.first);
+        } else {
+            int start = p.first;
+            for (int i = 0; i < p.second; ++i) {
+                decompressed += decompressed[start + i];
             }
         }
-
-        return compressed;
     }
+    
+    return decompressed;
+}
 
-    std::string descomprimir(const std::vector<Pair>& compressed) {
-        std::string decompressed;
-
-        for (const auto& p : compressed) {
-            if (p.position != -1) {
-                int start = decompressed.size() - p.position;
-                for (int i = 0; i < p.length; ++i) {
-                    decompressed += decompressed[start + i];
-                }
-            }
-            if (p.nextChar != '\0') {
-                decompressed += p.nextChar;
-            }
+// Calcular el tamaño del texto original y el tamaño en bits cuando está comprimido
+pair<int, int> calculateSizes(const string &original, const vector<Pair> &compressed) {
+    int originalSize = original.size() * 8; // cada carácter es de 8 bits
+    int compressedSize = 0;
+    
+    for (const Pair &p : compressed) {
+        if (p.second == 0) {
+            compressedSize += 8; // carácter ASCII (8 bits)
+        } else {
+            compressedSize += 16; // posición (8 bits) + longitud (8 bits)
         }
-
-        return decompressed;
     }
-};
+    
+    return {originalSize, compressedSize};
+}
