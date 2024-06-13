@@ -14,7 +14,6 @@ struct HuffmanNode {
     HuffmanNode(char data, unsigned freq) : data(data), freq(freq), left(nullptr), right(nullptr) {}
 };
 
-// Comparador para la cola de prioridad
 struct Compare {
     bool operator()(HuffmanNode* l, HuffmanNode* r) {
         return (l->freq > r->freq);
