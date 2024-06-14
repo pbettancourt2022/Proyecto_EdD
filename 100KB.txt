@@ -1,0 +1,4128 @@
+#endif
+					ace_load_mini_rx_ring(ap, RX_MINI_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+
+		if (ap->jumbo) {
+			cur_size = atomic_read(&ap->cur_jumbo_bufs);
+			if (cur_size < RX_LOW_JUMBO_THRES) {
+				if ((cur_size < RX_PANIC_JUMBO_THRES) &&
+				    !test_and_set_bit(0,
+						      &ap->jumbo_refill_busy)){
+#ifdef DEBUG
+					printk("low on jumbo buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+		if (run_tasklet && !ap->tasklet_pending) {
+			ap->tasklet_pending = 1;
+			tasklet_schedule(&ap->ace_tasklet);
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+
+#if ACENIC_DO_VLAN
+static void ace_vlan_rx_register(struct net_device *dev, struct vlan_group *grp)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	ap->vlgrp = grp;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+
+
+static void ace_vlan_rx_kill_vid(struct net_device *dev, unsigned short vid)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	if (ap->vlgrp)
+		ap->vlgrp->vlan_devices[vid] = NULL;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+#endif /* ACENIC_DO_VLAN */
+
+
+static int ace_open(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+
+	if (!(ap->fw_running)) {
+		printk(KERN_WARNING "%s: Firmware not running!\n", dev->name);
+		return -EBUSY;
+	}
+
+	writel(dev->mtu + ETH_HLEN + 4, &regs->IfMtu);
+
+	cmd.evt = C_CLEAR_STATS;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_UP;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	if (ap->jumbo &&
+	    !test_and_set_bit(0, &ap->jumbo_refill_busy))
+		ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+
+	if (dev->flags & IFF_PROMISC) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_ENABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+
+		ap->promisc = 1;
+	}else
+		ap->promisc = 0;
+	ap->mcast_all = 0;
+
+#if 0
+	cmd.evt = C_LNK_NEGOTIATION;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+#endif
+
+	netif_start_queue(dev);
+
+	/*
+	 * Setup the bottom half rx ring refill handler
+	 */
+	tasklet_init(&ap->ace_tasklet, ace_tasklet, (unsigned long)dev);
+	return 0;
+}
+
+
+static int ace_close(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+	unsigned long flags;
+	short i;
+
+	/*
+	 * Without (or before) releasing irq and stopping hardware, this
+	 * is an absolute non-sense, by the way. It will be reset instantly
+	 * by the first irq.
+	 */
+	netif_stop_queue(dev);
+
+	
+	if (ap->promisc) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_DISABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+		ap->promisc = 0;
+	}
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_DOWN;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	tasklet_kill(&ap->ace_tasklet);
+
+	/*
+	 * Make sure one CPU is not processing packets while
+	 * buffers are being released by another.
+	 */
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	for (i = 0; i < ACE_TX_RING_ENTRIES(ap); i++) {
+		struct sk_buff *skb;
+		dma_addr_t mapping;
+		struct tx_ring_info *info;
+
+		info = ap->skb->tx_skbuff + i;
+		skb = info->skb;
+		mapping = pci_unmap_addr(info, mapping);
+
+		if (mapping) {
+			if (ACE_IS_TIGON_I(ap)) {
+				struct tx_desc __iomem *tx 
+					= (struct tx_desc __iomem *) &ap->tx_ring[i];
+				writel(0, &tx->addr.addrhi);
+				writel(0, &tx->addr.addrlo);
+				writel(0, &tx->flagsize);
+			} else
+				memset(ap->tx_ring + i, 0,
+				       sizeof(struct tx_desc));
+			pci_unmap_page(ap->pdev, mapping,
+				       pci_unmap_len(info, maplen),
+				       PCI_DMA_TODEVICE);
+			pci_unmap_addr_set(info, mapping, 0);
+		}
+		if (skb) {
+			dev_kfree_skb(skb);
+			info->skb = NULL;
+		}
+	}
+
+	if (ap->jumbo) {
+		cmd.evt = C_RESET_JUMBO_RNG;
+		cmd.code = 0;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+	}
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+
+	return 0;
+}
+
+
+static inline dma_addr_t
+ace_map_tx_skb(struct ace_private *ap, struct sk_buff *skb,
+	       struct sk_buff *tail, u32 idx)
+{
+	dma_addr_t mapping;
+	struct tx_ring_info *info;
+
+	mapping = pci_map_page(ap->pdev, virt_to_page(skb->data),
+			       offset_in_page(skb->data),
+			       skb->len, PCI_DMA_TODEVICE);
+
+	info = ap->skb->tx_skbuff + idx;
+	info->skb = tail;
+	pci_unmap_addr_set(info, mapping, mapping);
+	pci_unmap_len_set(info, maplen, skb->len);
+	return mapping;
+}
+
+
+static inline void
+ace_load_tx_bd(struct ace_private *ap, struct tx_desc *desc, u64 addr,
+	       u32 flagsize, u32 vlan_tag)
+{
+#if !USE_TX_COAL_NOW
+	flagsize &= ~BD_FLG_COAL_NOW;
+#endif
+
+	if (ACE_IS_TIGON_I(ap)) {
+		struct tx_desc __iomem *io = (struct tx_desc __iomem *) desc;
+		writel(addr >> 32, &io->addr.addrhi);
+		writel(addr & 0xffffffff, &io->addr.addrlo);
+		writel(flagsize, &io->flagsize);
+#if ACENIC_DO_VLAN
+		writel(vlan_tag, &io->vlanres);
+#endif
+	} else {
+		desc->addr.addrhi = addr >> 32;
+		desc->addr.addrlo = addr;
+		desc->flagsize = flagsize;
+#if ACENIC_DO_VLAN
+		desc->vlanres = vlan_tag;
+#endif
+	}
+}
+
+
+static int ace_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct tx_desc *desc;
+	u32 idx, flagsize;
+	unsigned long maxjiff = jiffies + 3*HZ;
+
+restart:
+	idx = ap->tx_prd;
+
+	if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+		goto overflow;
+
+	if (!skb_shinfo(skb)->nr_frags)	{
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, skb, idx);
+		flagsize = (skb->len << 16) | (BD_FLG_END);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+		desc = ap->tx_ring + idx;
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		/* Look at ace_tx_int for explanations. */
+		if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+			flagsize |= BD_FLG_COAL_NOW;
+
+		ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+	} else {
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+		int i, len = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, NULL, idx);
+		flagsize = (skb_headlen(skb) << 16);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+
+		ace_load_tx_bd(ap, ap->tx_ring + idx, mapping, flagsize, vlan_tag);
+
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct tx_ring_info *info;
+
+			len += frag->size;
+			info = ap->skb->tx_skbuff + idx;
+			desc = ap->tx_ring + idx;
+
+			mapping = pci_map_page(ap->pdev, frag->page,
+					       frag->page_offset, frag->size,
+					       PCI_DMA_TODEVICE);
+
+			flagsize = (frag->size << 16);
+			if (skb->ip_summed == CHECKSUM_HW)
+				flagsize |= BD_FLG_TCP_UDP_SUM;
+			idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+			if (i == skb_shinfo(skb)->nr_frags - 1) {
+				flagsize |= BD_FLG_END;
+				if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+					flagsize |= BD_FLG_COAL_NOW;
+
+				/*
+				 * Only the last fragment frees
+				 * the skb!
+				 */
+				info->skb = skb;
+			} else {
+				info->skb = NULL;
+			}
+			pci_unmap_addr_set(info, mapping, mapping);
+			pci_unmap_len_set(info, maplen, frag->size);
+			ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+		}
+	}
+
+ 	wmb();
+ 	ap->tx_prd = idx;
+ 	ace_set_txprd(regs, ap, idx);
+
+	if (flagsize & BD_FLG_COAL_NOW) {
+		netif_stop_queue(dev);
+
+		/*
+		 * A TX-descriptor producer (an IRQ) might have gotten
+		 * inbetween, making the ring free again. Since xmit is
+		 * serialized, this is the only situation we have to
+		 * re-test.
+		 */
+		if (!tx_ring_full(ap, ap->tx_ret_csm, idx))
+			netif_wake_queue(dev);
+	}
+
+	dev->trans_start = jiffies;
+	return NETDEV_TX_OK;
+
+overflow:
+	/*
+	 * This race condition is unavoidable with lock-free drivers.
+	 * We wake up the queue _before_ tx_prd is advanced, so that we can
+	 * enter hard_start_xmit too early, while tx ring still looks closed.
+	 * This happens ~1-4 times per 100000 packets, so that we can allow
+	 * to loop syncing to other CPU. Probably, we need an additional
+	 * wmb() in ace_tx_intr as well.
+	 *
+	 * Note that this race is relieved by reserving one more entry
+	 * in tx ring than it is necessary (see original non-SG driver).
+	 * However, with SG we need to reserve 2*MAX_SKB_FRAGS+1, which
+	 * is already overkill.
+	 *
+	 * Alternative is to return with 1 not throttling queue. In this
+	 * case loop becomes longer, no more useful effects.
+	 */
+	if (time_before(jiffies, maxjiff)) {
+		barrier();
+		cpu_relax();
+		goto restart;
+	}
+	
+	/* The ring is stuck full. */
+	printk(KERN_WARNING "%s: Transmit ring stuck full\n", dev->name);
+	return NETDEV_TX_BUSY;
+}
+
+
+static int ace_change_mtu(struct net_device *dev, int new_mtu)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+
+	if (new_mtu > ACE_JUMBO_MTU)
+		return -EINVAL;
+
+	writel(new_mtu + ETH_HLEN + 4, &regs->IfMtu);
+	dev->mtu = new_mtu;
+
+	if (new_mtu > ACE_STD_MTU) {
+		if (!(ap->jumbo)) {
+			printk(KERN_INFO "%s: Enabling Jumbo frame "
+			       "support\n", dev->name);
+			ap->jumbo = 1;
+			if (!test_and_set_bit(0, &ap->jumbo_refill_busy))
+				ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+			ace_set_rxtx_parms(dev, 1);
+		}
+	} else {
+		while (test_and_set_bit(0, &ap->jumbo_refill_busy));
+		ace_sync_irq(dev->irq);
+		ace_set_rxtx_parms(dev, 0);
+		if (ap->jumbo) {
+			struct cmd cmd;
+
+			cmd.evt = C_RESET_JUMBO_RNG;
+			cmd.code = 0;
+			cmd.idx = 0;
+			ace_issue_cmd(regs, &cmd);
+		}
+	}
+
+	return 0;
+}
+
+static int ace_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link;
+
+	memset(ecmd, 0, sizeof(struct ethtool_cmd));
+	ecmd->supported =
+		(SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+		 SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+		 SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+		 SUPPORTED_Autoneg | SUPPORTED_FIBRE);
+
+	ecmd->port = PORT_FIBRE;
+	ecmd->transceiver = XCVR_INTERNAL;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		ecmd->speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			ecmd->speed = SPEED_100;
+		else if (link & LNK_10MB)
+			ecmd->speed = SPEED_10;
+		else
+			ecmd->speed = 0;
+	}
+	if (link & LNK_FULL_DUPLEX)
+		ecmd->duplex = DUPLEX_FULL;
+	else
+		ecmd->duplex = DUPLEX_HALF;
+
+	if (link & LNK_NEGOTIATE)
+		ecmd->autoneg = AUTONEG_ENABLE;
+	else
+		ecmd->autoneg = AUTONEG_DISABLE;
+
+#if 0
+	/*
+	 * Current struct ethtool_cmd is insufficient
+	 */
+	ecmd->trace = readl(&regs->TuneTrace);
+
+	ecmd->txcoal = readl(&regs->TuneTxCoalTicks);
+	ecmd->rxcoal = readl(&regs->TuneRxCoalTicks);
+#endif
+	ecmd->maxtxpkt = readl(&regs->TuneMaxTxDesc);
+	ecmd->maxrxpkt = readl(&regs->TuneMaxRxDesc);
+
+	return 0;
+}
+
+static int ace_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link, speed;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			speed = SPEED_100;
+		else if (link & LNK_10MB)
+			speed = SPEED_10;
+		else
+			speed = SPEED_100;
+	}
+
+	link = LNK_ENABLE | LNK_1000MB | LNK_100MB | LNK_10MB |
+		LNK_RX_FLOW_CTL_Y | LNK_NEG_FCTL;
+	if (!ACE_IS_TIGON_I(ap))
+		link |= LNK_TX_FLOW_CTL_Y;
+	if (ecmd->autoneg == AUTONEG_ENABLE)
+		link |= LNK_NEGOTIATE;
+	if (ecmd->speed != speed) #ifdef DEBUG
+					printk("low on mini buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_mini_rx_ring(ap, RX_MINI_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+
+		if (ap->jumbo) {
+			cur_size = atomic_read(&ap->cur_jumbo_bufs);
+			if (cur_size < RX_LOW_JUMBO_THRES) {
+				if ((cur_size < RX_PANIC_JUMBO_THRES) &&
+				    !test_and_set_bit(0,
+						      &ap->jumbo_refill_busy)){
+#ifdef DEBUG
+					printk("low on jumbo buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+		if (run_tasklet && !ap->tasklet_pending) {
+			ap->tasklet_pending = 1;
+			tasklet_schedule(&ap->ace_tasklet);
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+
+#if ACENIC_DO_VLAN
+static void ace_vlan_rx_register(struct net_device *dev, struct vlan_group *grp)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	ap->vlgrp = grp;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+
+
+static void ace_vlan_rx_kill_vid(struct net_device *dev, unsigned short vid)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	if (ap->vlgrp)
+		ap->vlgrp->vlan_devices[vid] = NULL;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+#endif /* ACENIC_DO_VLAN */
+
+
+static int ace_open(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+
+	if (!(ap->fw_running)) {
+		printk(KERN_WARNING "%s: Firmware not running!\n", dev->name);
+		return -EBUSY;
+	}
+
+	writel(dev->mtu + ETH_HLEN + 4, &regs->IfMtu);
+
+	cmd.evt = C_CLEAR_STATS;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_UP;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	if (ap->jumbo &&
+	    !test_and_set_bit(0, &ap->jumbo_refill_busy))
+		ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+
+	if (dev->flags & IFF_PROMISC) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_ENABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+
+		ap->promisc = 1;
+	}else
+		ap->promisc = 0;
+	ap->mcast_all = 0;
+
+#if 0
+	cmd.evt = C_LNK_NEGOTIATION;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+#endif
+
+	netif_start_queue(dev);
+
+	/*
+	 * Setup the bottom half rx ring refill handler
+	 */
+	tasklet_init(&ap->ace_tasklet, ace_tasklet, (unsigned long)dev);
+	return 0;
+}
+
+
+static int ace_close(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+	unsigned long flags;
+	short i;
+
+	/*
+	 * Without (or before) releasing irq and stopping hardware, this
+	 * is an absolute non-sense, by the way. It will be reset instantly
+	 * by the first irq.
+	 */
+	netif_stop_queue(dev);
+
+	
+	if (ap->promisc) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_DISABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+		ap->promisc = 0;
+	}
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_DOWN;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	tasklet_kill(&ap->ace_tasklet);
+
+	/*
+	 * Make sure one CPU is not processing packets while
+	 * buffers are being released by another.
+	 */
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	for (i = 0; i < ACE_TX_RING_ENTRIES(ap); i++) {
+		struct sk_buff *skb;
+		dma_addr_t mapping;
+		struct tx_ring_info *info;
+
+		info = ap->skb->tx_skbuff + i;
+		skb = info->skb;
+		mapping = pci_unmap_addr(info, mapping);
+
+		if (mapping) {
+			if (ACE_IS_TIGON_I(ap)) {
+				struct tx_desc __iomem *tx 
+					= (struct tx_desc __iomem *) &ap->tx_ring[i];
+				writel(0, &tx->addr.addrhi);
+				writel(0, &tx->addr.addrlo);
+				writel(0, &tx->flagsize);
+			} else
+				memset(ap->tx_ring + i, 0,
+				       sizeof(struct tx_desc));
+			pci_unmap_page(ap->pdev, mapping,
+				       pci_unmap_len(info, maplen),
+				       PCI_DMA_TODEVICE);
+			pci_unmap_addr_set(info, mapping, 0);
+		}
+		if (skb) {
+			dev_kfree_skb(skb);
+			info->skb = NULL;
+		}
+	}
+
+	if (ap->jumbo) {
+		cmd.evt = C_RESET_JUMBO_RNG;
+		cmd.code = 0;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+	}
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+
+	return 0;
+}
+
+
+static inline dma_addr_t
+ace_map_tx_skb(struct ace_private *ap, struct sk_buff *skb,
+	       struct sk_buff *tail, u32 idx)
+{
+	dma_addr_t mapping;
+	struct tx_ring_info *info;
+
+	mapping = pci_map_page(ap->pdev, virt_to_page(skb->data),
+			       offset_in_page(skb->data),
+			       skb->len, PCI_DMA_TODEVICE);
+
+	info = ap->skb->tx_skbuff + idx;
+	info->skb = tail;
+	pci_unmap_addr_set(info, mapping, mapping);
+	pci_unmap_len_set(info, maplen, skb->len);
+	return mapping;
+}
+
+
+static inline void
+ace_load_tx_bd(struct ace_private *ap, struct tx_desc *desc, u64 addr,
+	       u32 flagsize, u32 vlan_tag)
+{
+#if !USE_TX_COAL_NOW
+	flagsize &= ~BD_FLG_COAL_NOW;
+#endif
+
+	if (ACE_IS_TIGON_I(ap)) {
+		struct tx_desc __iomem *io = (struct tx_desc __iomem *) desc;
+		writel(addr >> 32, &io->addr.addrhi);
+		writel(addr & 0xffffffff, &io->addr.addrlo);
+		writel(flagsize, &io->flagsize);
+#if ACENIC_DO_VLAN
+		writel(vlan_tag, &io->vlanres);
+#endif
+	} else {
+		desc->addr.addrhi = addr >> 32;
+		desc->addr.addrlo = addr;
+		desc->flagsize = flagsize;
+#if ACENIC_DO_VLAN
+		desc->vlanres = vlan_tag;
+#endif
+	}
+}
+
+
+static int ace_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct tx_desc *desc;
+	u32 idx, flagsize;
+	unsigned long maxjiff = jiffies + 3*HZ;
+
+restart:
+	idx = ap->tx_prd;
+
+	if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+		goto overflow;
+
+	if (!skb_shinfo(skb)->nr_frags)	{
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, skb, idx);
+		flagsize = (skb->len << 16) | (BD_FLG_END);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+		desc = ap->tx_ring + idx;
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		/* Look at ace_tx_int for explanations. */
+		if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+			flagsize |= BD_FLG_COAL_NOW;
+
+		ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+	} else {
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+		int i, len = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, NULL, idx);
+		flagsize = (skb_headlen(skb) << 16);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+
+		ace_load_tx_bd(ap, ap->tx_ring + idx, mapping, flagsize, vlan_tag);
+
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct tx_ring_info *info;
+
+			len += frag->size;
+			info = ap->skb->tx_skbuff + idx;
+			desc = ap->tx_ring + idx;
+
+			mapping = pci_map_page(ap->pdev, frag->page,
+					       frag->page_offset, frag->size,
+					       PCI_DMA_TODEVICE);
+
+			flagsize = (frag->size << 16);
+			if (skb->ip_summed == CHECKSUM_HW)
+				flagsize |= BD_FLG_TCP_UDP_SUM;
+			idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+			if (i == skb_shinfo(skb)->nr_frags - 1) {
+				flagsize |= BD_FLG_END;
+				if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+					flagsize |= BD_FLG_COAL_NOW;
+
+				/*
+				 * Only the last fragment frees
+				 * the skb!
+				 */
+				info->skb = skb;
+			} else {
+				info->skb = NULL;
+			}
+			pci_unmap_addr_set(info, mapping, mapping);
+			pci_unmap_len_set(info, maplen, frag->size);
+			ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+		}
+	}
+
+ 	wmb();
+ 	ap->tx_prd = idx;
+ 	ace_set_txprd(regs, ap, idx);
+
+	if (flagsize & BD_FLG_COAL_NOW) {
+		netif_stop_queue(dev);
+
+		/*
+		 * A TX-descriptor producer (an IRQ) might have gotten
+		 * inbetween, making the ring free again. Since xmit is
+		 * serialized, this is the only situation we have to
+		 * re-test.
+		 */
+		if (!tx_ring_full(ap, ap->tx_ret_csm, idx))
+			netif_wake_queue(dev);
+	}
+
+	dev->trans_start = jiffies;
+	return NETDEV_TX_OK;
+
+overflow:
+	/*
+	 * This race condition is unavoidable with lock-free drivers.
+	 * We wake up the queue _before_ tx_prd is advanced, so that we can
+	 * enter hard_start_xmit too early, while tx ring still looks closed.
+	 * This happens ~1-4 times per 100000 packets, so that we can allow
+	 * to loop syncing to other CPU. Probably, we need an additional
+	 * wmb() in ace_tx_intr as well.
+	 *
+	 * Note that this race is relieved by reserving one more entry
+	 * in tx ring than it is necessary (see original non-SG driver).
+	 * However, with SG we need to reserve 2*MAX_SKB_FRAGS+1, which
+	 * is already overkill.
+	 *
+	 * Alternative is to return with 1 not throttling queue. In this
+	 * case loop becomes longer, no more useful effects.
+	 */
+	if (time_before(jiffies, maxjiff)) {
+		barrier();
+		cpu_relax();
+		goto restart;
+	}
+	
+	/* The ring is stuck full. */
+	printk(KERN_WARNING "%s: Transmit ring stuck full\n", dev->name);
+	return NETDEV_TX_BUSY;
+}
+
+
+static int ace_change_mtu(struct net_device *dev, int new_mtu)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+
+	if (new_mtu > ACE_JUMBO_MTU)
+		return -EINVAL;
+
+	writel(new_mtu + ETH_HLEN + 4, &regs->IfMtu);
+	dev->mtu = new_mtu;
+
+	if (new_mtu > ACE_STD_MTU) {
+		if (!(ap->jumbo)) {
+			printk(KERN_INFO "%s: Enabling Jumbo frame "
+			       "support\n", dev->name);
+			ap->jumbo = 1;
+			if (!test_and_set_bit(0, &ap->jumbo_refill_busy))
+				ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+			ace_set_rxtx_parms(dev, 1);
+		}
+	} else {
+		while (test_and_set_bit(0, &ap->jumbo_refill_busy));
+		ace_sync_irq(dev->irq);
+		ace_set_rxtx_parms(dev, 0);
+		if (ap->jumbo) {
+			struct cmd cmd;
+
+			cmd.evt = C_RESET_JUMBO_RNG;
+			cmd.code = 0;
+			cmd.idx = 0;
+			ace_issue_cmd(regs, &cmd);
+		}
+	}
+
+	return 0;
+}
+
+static int ace_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link;
+
+	memset(ecmd, 0, sizeof(struct ethtool_cmd));
+	ecmd->supported =
+		(SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+		 SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+		 SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+		 SUPPORTED_Autoneg | SUPPORTED_FIBRE);
+
+	ecmd->port = PORT_FIBRE;
+	ecmd->transceiver = XCVR_INTERNAL;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		ecmd->speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			ecmd->speed = SPEED_100;
+		else if (link & LNK_10MB)
+			ecmd->speed = SPEED_10;
+		else
+			ecmd->speed = 0;
+	}
+	if (link & LNK_FULL_DUPLEX)
+		ecmd->duplex = DUPLEX_FULL;
+	else
+		ecmd->duplex = DUPLEX_HALF;
+
+	if (link & LNK_NEGOTIATE)
+		ecmd->autoneg = AUTONEG_ENABLE;
+	else
+		ecmd->autoneg = AUTONEG_DISABLE;
+
+#if 0
+	/*
+	 * Current struct ethtool_cmd is insufficient
+	 */
+	ecmd->trace = readl(&regs->TuneTrace);
+
+	ecmd->txcoal = readl(&regs->TuneTxCoalTicks);
+	ecmd->rxcoal = readl(&regs->TuneRxCoalTicks);
+#endif
+	ecmd->maxtxpkt = readl(&regs->TuneMaxTxDesc);
+	ecmd->maxrxpkt = readl(&regs->TuneMaxRxDesc);
+
+	return 0;
+}
+
+static int ace_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link, speed;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			speed = SPEED_100;
+		else if (link & LNK_10MB)
+			speed = SPEED_10;
+		else
+			speed = SPEED_100;
+	}
+
+	link = LNK_ENABLE | LNK_1000MB | LNK_100MB | LNK_10MB |
+		LNK_RX_FLOW_CTL_Y | LNK_NEG_FCTL;
+	if (!ACE_IS_TIGON_I(ap))
+		link |= LNK_TX_FLOW_CTL_Y;
+	if (ecmd->autoneg == AUTONEG_ENABLE)
+		link |= LNK_NEGOTIATE;
+	if (ecmd->speed != speed) #ifdef DEBUG
+					printk("low on mini buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_mini_rx_ring(ap, RX_MINI_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+
+		if (ap->jumbo) {
+			cur_size = atomic_read(&ap->cur_jumbo_bufs);
+			if (cur_size < RX_LOW_JUMBO_THRES) {
+				if ((cur_size < RX_PANIC_JUMBO_THRES) &&
+				    !test_and_set_bit(0,
+						      &ap->jumbo_refill_busy)){
+#ifdef DEBUG
+					printk("low on jumbo buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+		if (run_tasklet && !ap->tasklet_pending) {
+			ap->tasklet_pending = 1;
+			tasklet_schedule(&ap->ace_tasklet);
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+
+#if ACENIC_DO_VLAN
+static void ace_vlan_rx_register(struct net_device *dev, struct vlan_group *grp)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	ap->vlgrp = grp;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+
+
+static void ace_vlan_rx_kill_vid(struct net_device *dev, unsigned short vid)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	if (ap->vlgrp)
+		ap->vlgrp->vlan_devices[vid] = NULL;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+#endif /* ACENIC_DO_VLAN */
+
+
+static int ace_open(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+
+	if (!(ap->fw_running)) {
+		printk(KERN_WARNING "%s: Firmware not running!\n", dev->name);
+		return -EBUSY;
+	}
+
+	writel(dev->mtu + ETH_HLEN + 4, &regs->IfMtu);
+
+	cmd.evt = C_CLEAR_STATS;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_UP;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	if (ap->jumbo &&
+	    !test_and_set_bit(0, &ap->jumbo_refill_busy))
+		ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+
+	if (dev->flags & IFF_PROMISC) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_ENABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+
+		ap->promisc = 1;
+	}else
+		ap->promisc = 0;
+	ap->mcast_all = 0;
+
+#if 0
+	cmd.evt = C_LNK_NEGOTIATION;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+#endif
+
+	netif_start_queue(dev);
+
+	/*
+	 * Setup the bottom half rx ring refill handler
+	 */
+	tasklet_init(&ap->ace_tasklet, ace_tasklet, (unsigned long)dev);
+	return 0;
+}
+
+
+static int ace_close(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+	unsigned long flags;
+	short i;
+
+	/*
+	 * Without (or before) releasing irq and stopping hardware, this
+	 * is an absolute non-sense, by the way. It will be reset instantly
+	 * by the first irq.
+	 */
+	netif_stop_queue(dev);
+
+	
+	if (ap->promisc) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_DISABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+		ap->promisc = 0;
+	}
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_DOWN;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	tasklet_kill(&ap->ace_tasklet);
+
+	/*
+	 * Make sure one CPU is not processing packets while
+	 * buffers are being released by another.
+	 */
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	for (i = 0; i < ACE_TX_RING_ENTRIES(ap); i++) {
+		struct sk_buff *skb;
+		dma_addr_t mapping;
+		struct tx_ring_info *info;
+
+		info = ap->skb->tx_skbuff + i;
+		skb = info->skb;
+		mapping = pci_unmap_addr(info, mapping);
+
+		if (mapping) {
+			if (ACE_IS_TIGON_I(ap)) {
+				struct tx_desc __iomem *tx 
+					= (struct tx_desc __iomem *) &ap->tx_ring[i];
+				writel(0, &tx->addr.addrhi);
+				writel(0, &tx->addr.addrlo);
+				writel(0, &tx->flagsize);
+			} else
+				memset(ap->tx_ring + i, 0,
+				       sizeof(struct tx_desc));
+			pci_unmap_page(ap->pdev, mapping,
+				       pci_unmap_len(info, maplen),
+				       PCI_DMA_TODEVICE);
+			pci_unmap_addr_set(info, mapping, 0);
+		}
+		if (skb) {
+			dev_kfree_skb(skb);
+			info->skb = NULL;
+		}
+	}
+
+	if (ap->jumbo) {
+		cmd.evt = C_RESET_JUMBO_RNG;
+		cmd.code = 0;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+	}
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+
+	return 0;
+}
+
+
+static inline dma_addr_t
+ace_map_tx_skb(struct ace_private *ap, struct sk_buff *skb,
+	       struct sk_buff *tail, u32 idx)
+{
+	dma_addr_t mapping;
+	struct tx_ring_info *info;
+
+	mapping = pci_map_page(ap->pdev, virt_to_page(skb->data),
+			       offset_in_page(skb->data),
+			       skb->len, PCI_DMA_TODEVICE);
+
+	info = ap->skb->tx_skbuff + idx;
+	info->skb = tail;
+	pci_unmap_addr_set(info, mapping, mapping);
+	pci_unmap_len_set(info, maplen, skb->len);
+	return mapping;
+}
+
+
+static inline void
+ace_load_tx_bd(struct ace_private *ap, struct tx_desc *desc, u64 addr,
+	       u32 flagsize, u32 vlan_tag)
+{
+#if !USE_TX_COAL_NOW
+	flagsize &= ~BD_FLG_COAL_NOW;
+#endif
+
+	if (ACE_IS_TIGON_I(ap)) {
+		struct tx_desc __iomem *io = (struct tx_desc __iomem *) desc;
+		writel(addr >> 32, &io->addr.addrhi);
+		writel(addr & 0xffffffff, &io->addr.addrlo);
+		writel(flagsize, &io->flagsize);
+#if ACENIC_DO_VLAN
+		writel(vlan_tag, &io->vlanres);
+#endif
+	} else {
+		desc->addr.addrhi = addr >> 32;
+		desc->addr.addrlo = addr;
+		desc->flagsize = flagsize;
+#if ACENIC_DO_VLAN
+		desc->vlanres = vlan_tag;
+#endif
+	}
+}
+
+
+static int ace_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct tx_desc *desc;
+	u32 idx, flagsize;
+	unsigned long maxjiff = jiffies + 3*HZ;
+
+restart:
+	idx = ap->tx_prd;
+
+	if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+		goto overflow;
+
+	if (!skb_shinfo(skb)->nr_frags)	{
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, skb, idx);
+		flagsize = (skb->len << 16) | (BD_FLG_END);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+		desc = ap->tx_ring + idx;
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		/* Look at ace_tx_int for explanations. */
+		if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+			flagsize |= BD_FLG_COAL_NOW;
+
+		ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+	} else {
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+		int i, len = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, NULL, idx);
+		flagsize = (skb_headlen(skb) << 16);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+
+		ace_load_tx_bd(ap, ap->tx_ring + idx, mapping, flagsize, vlan_tag);
+
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct tx_ring_info *info;
+
+			len += frag->size;
+			info = ap->skb->tx_skbuff + idx;
+			desc = ap->tx_ring + idx;
+
+			mapping = pci_map_page(ap->pdev, frag->page,
+					       frag->page_offset, frag->size,
+					       PCI_DMA_TODEVICE);
+
+			flagsize = (frag->size << 16);
+			if (skb->ip_summed == CHECKSUM_HW)
+				flagsize |= BD_FLG_TCP_UDP_SUM;
+			idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+			if (i == skb_shinfo(skb)->nr_frags - 1) {
+				flagsize |= BD_FLG_END;
+				if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+					flagsize |= BD_FLG_COAL_NOW;
+
+				/*
+				 * Only the last fragment frees
+				 * the skb!
+				 */
+				info->skb = skb;
+			} else {
+				info->skb = NULL;
+			}
+			pci_unmap_addr_set(info, mapping, mapping);
+			pci_unmap_len_set(info, maplen, frag->size);
+			ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+		}
+	}
+
+ 	wmb();
+ 	ap->tx_prd = idx;
+ 	ace_set_txprd(regs, ap, idx);
+
+	if (flagsize & BD_FLG_COAL_NOW) {
+		netif_stop_queue(dev);
+
+		/*
+		 * A TX-descriptor producer (an IRQ) might have gotten
+		 * inbetween, making the ring free again. Since xmit is
+		 * serialized, this is the only situation we have to
+		 * re-test.
+		 */
+		if (!tx_ring_full(ap, ap->tx_ret_csm, idx))
+			netif_wake_queue(dev);
+	}
+
+	dev->trans_start = jiffies;
+	return NETDEV_TX_OK;
+
+overflow:
+	/*
+	 * This race condition is unavoidable with lock-free drivers.
+	 * We wake up the queue _before_ tx_prd is advanced, so that we can
+	 * enter hard_start_xmit too early, while tx ring still looks closed.
+	 * This happens ~1-4 times per 100000 packets, so that we can allow
+	 * to loop syncing to other CPU. Probably, we need an additional
+	 * wmb() in ace_tx_intr as well.
+	 *
+	 * Note that this race is relieved by reserving one more entry
+	 * in tx ring than it is necessary (see original non-SG driver).
+	 * However, with SG we need to reserve 2*MAX_SKB_FRAGS+1, which
+	 * is already overkill.
+	 *
+	 * Alternative is to return with 1 not throttling queue. In this
+	 * case loop becomes longer, no more useful effects.
+	 */
+	if (time_before(jiffies, maxjiff)) {
+		barrier();
+		cpu_relax();
+		goto restart;
+	}
+	
+	/* The ring is stuck full. */
+	printk(KERN_WARNING "%s: Transmit ring stuck full\n", dev->name);
+	return NETDEV_TX_BUSY;
+}
+
+
+static int ace_change_mtu(struct net_device *dev, int new_mtu)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+
+	if (new_mtu > ACE_JUMBO_MTU)
+		return -EINVAL;
+
+	writel(new_mtu + ETH_HLEN + 4, &regs->IfMtu);
+	dev->mtu = new_mtu;
+
+	if (new_mtu > ACE_STD_MTU) {
+		if (!(ap->jumbo)) {
+			printk(KERN_INFO "%s: Enabling Jumbo frame "
+			       "support\n", dev->name);
+			ap->jumbo = 1;
+			if (!test_and_set_bit(0, &ap->jumbo_refill_busy))
+				ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+			ace_set_rxtx_parms(dev, 1);
+		}
+	} else {
+		while (test_and_set_bit(0, &ap->jumbo_refill_busy));
+		ace_sync_irq(dev->irq);
+		ace_set_rxtx_parms(dev, 0);
+		if (ap->jumbo) {
+			struct cmd cmd;
+
+			cmd.evt = C_RESET_JUMBO_RNG;
+			cmd.code = 0;
+			cmd.idx = 0;
+			ace_issue_cmd(regs, &cmd);
+		}
+	}
+
+	return 0;
+}
+
+static int ace_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link;
+
+	memset(ecmd, 0, sizeof(struct ethtool_cmd));
+	ecmd->supported =
+		(SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+		 SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+		 SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+		 SUPPORTED_Autoneg | SUPPORTED_FIBRE);
+
+	ecmd->port = PORT_FIBRE;
+	ecmd->transceiver = XCVR_INTERNAL;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		ecmd->speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			ecmd->speed = SPEED_100;
+		else if (link & LNK_10MB)
+			ecmd->speed = SPEED_10;
+		else
+			ecmd->speed = 0;
+	}
+	if (link & LNK_FULL_DUPLEX)
+		ecmd->duplex = DUPLEX_FULL;
+	else
+		ecmd->duplex = DUPLEX_HALF;
+
+	if (link & LNK_NEGOTIATE)
+		ecmd->autoneg = AUTONEG_ENABLE;
+	else
+		ecmd->autoneg = AUTONEG_DISABLE;
+
+#if 0
+	/*
+	 * Current struct ethtool_cmd is insufficient
+	 */
+	ecmd->trace = readl(&regs->TuneTrace);
+
+	ecmd->txcoal = readl(&regs->TuneTxCoalTicks);
+	ecmd->rxcoal = readl(&regs->TuneRxCoalTicks);
+#endif
+	ecmd->maxtxpkt = readl(&regs->TuneMaxTxDesc);
+	ecmd->maxrxpkt = readl(&regs->TuneMaxRxDesc);
+
+	return 0;
+}
+
+static int ace_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link, speed;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			speed = SPEED_100;
+		else if (link & LNK_10MB)
+			speed = SPEED_10;
+		else
+			speed = SPEED_100;
+	}
+
+	link = LNK_ENABLE | LNK_1000MB | LNK_100MB | LNK_10MB |
+		LNK_RX_FLOW_CTL_Y | LNK_NEG_FCTL;
+	if (!ACE_IS_TIGON_I(ap))
+		link |= LNK_TX_FLOW_CTL_Y;
+	if (ecmd->autoneg == AUTONEG_ENABLE)
+		link |= LNK_NEGOTIATE;
+	if (ecmd->speed != speed) #ifdef DEBUG
+					printk("low on mini buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_mini_rx_ring(ap, RX_MINI_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+
+		if (ap->jumbo) {
+			cur_size = atomic_read(&ap->cur_jumbo_bufs);
+			if (cur_size < RX_LOW_JUMBO_THRES) {
+				if ((cur_size < RX_PANIC_JUMBO_THRES) &&
+				    !test_and_set_bit(0,
+						      &ap->jumbo_refill_busy)){
+#ifdef DEBUG
+					printk("low on jumbo buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+		if (run_tasklet && !ap->tasklet_pending) {
+			ap->tasklet_pending = 1;
+			tasklet_schedule(&ap->ace_tasklet);
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+
+#if ACENIC_DO_VLAN
+static void ace_vlan_rx_register(struct net_device *dev, struct vlan_group *grp)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	ap->vlgrp = grp;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+
+
+static void ace_vlan_rx_kill_vid(struct net_device *dev, unsigned short vid)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	if (ap->vlgrp)
+		ap->vlgrp->vlan_devices[vid] = NULL;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+#endif /* ACENIC_DO_VLAN */
+
+
+static int ace_open(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+
+	if (!(ap->fw_running)) {
+		printk(KERN_WARNING "%s: Firmware not running!\n", dev->name);
+		return -EBUSY;
+	}
+
+	writel(dev->mtu + ETH_HLEN + 4, &regs->IfMtu);
+
+	cmd.evt = C_CLEAR_STATS;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_UP;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	if (ap->jumbo &&
+	    !test_and_set_bit(0, &ap->jumbo_refill_busy))
+		ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+
+	if (dev->flags & IFF_PROMISC) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_ENABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+
+		ap->promisc = 1;
+	}else
+		ap->promisc = 0;
+	ap->mcast_all = 0;
+
+#if 0
+	cmd.evt = C_LNK_NEGOTIATION;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+#endif
+
+	netif_start_queue(dev);
+
+	/*
+	 * Setup the bottom half rx ring refill handler
+	 */
+	tasklet_init(&ap->ace_tasklet, ace_tasklet, (unsigned long)dev);
+	return 0;
+}
+
+
+static int ace_close(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+	unsigned long flags;
+	short i;
+
+	/*
+	 * Without (or before) releasing irq and stopping hardware, this
+	 * is an absolute non-sense, by the way. It will be reset instantly
+	 * by the first irq.
+	 */
+	netif_stop_queue(dev);
+
+	
+	if (ap->promisc) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_DISABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+		ap->promisc = 0;
+	}
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_DOWN;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	tasklet_kill(&ap->ace_tasklet);
+
+	/*
+	 * Make sure one CPU is not processing packets while
+	 * buffers are being released by another.
+	 */
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	for (i = 0; i < ACE_TX_RING_ENTRIES(ap); i++) {
+		struct sk_buff *skb;
+		dma_addr_t mapping;
+		struct tx_ring_info *info;
+
+		info = ap->skb->tx_skbuff + i;
+		skb = info->skb;
+		mapping = pci_unmap_addr(info, mapping);
+
+		if (mapping) {
+			if (ACE_IS_TIGON_I(ap)) {
+				struct tx_desc __iomem *tx 
+					= (struct tx_desc __iomem *) &ap->tx_ring[i];
+				writel(0, &tx->addr.addrhi);
+				writel(0, &tx->addr.addrlo);
+				writel(0, &tx->flagsize);
+			} else
+				memset(ap->tx_ring + i, 0,
+				       sizeof(struct tx_desc));
+			pci_unmap_page(ap->pdev, mapping,
+				       pci_unmap_len(info, maplen),
+				       PCI_DMA_TODEVICE);
+			pci_unmap_addr_set(info, mapping, 0);
+		}
+		if (skb) {
+			dev_kfree_skb(skb);
+			info->skb = NULL;
+		}
+	}
+
+	if (ap->jumbo) {
+		cmd.evt = C_RESET_JUMBO_RNG;
+		cmd.code = 0;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+	}
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+
+	return 0;
+}
+
+
+static inline dma_addr_t
+ace_map_tx_skb(struct ace_private *ap, struct sk_buff *skb,
+	       struct sk_buff *tail, u32 idx)
+{
+	dma_addr_t mapping;
+	struct tx_ring_info *info;
+
+	mapping = pci_map_page(ap->pdev, virt_to_page(skb->data),
+			       offset_in_page(skb->data),
+			       skb->len, PCI_DMA_TODEVICE);
+
+	info = ap->skb->tx_skbuff + idx;
+	info->skb = tail;
+	pci_unmap_addr_set(info, mapping, mapping);
+	pci_unmap_len_set(info, maplen, skb->len);
+	return mapping;
+}
+
+
+static inline void
+ace_load_tx_bd(struct ace_private *ap, struct tx_desc *desc, u64 addr,
+	       u32 flagsize, u32 vlan_tag)
+{
+#if !USE_TX_COAL_NOW
+	flagsize &= ~BD_FLG_COAL_NOW;
+#endif
+
+	if (ACE_IS_TIGON_I(ap)) {
+		struct tx_desc __iomem *io = (struct tx_desc __iomem *) desc;
+		writel(addr >> 32, &io->addr.addrhi);
+		writel(addr & 0xffffffff, &io->addr.addrlo);
+		writel(flagsize, &io->flagsize);
+#if ACENIC_DO_VLAN
+		writel(vlan_tag, &io->vlanres);
+#endif
+	} else {
+		desc->addr.addrhi = addr >> 32;
+		desc->addr.addrlo = addr;
+		desc->flagsize = flagsize;
+#if ACENIC_DO_VLAN
+		desc->vlanres = vlan_tag;
+#endif
+	}
+}
+
+
+static int ace_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct tx_desc *desc;
+	u32 idx, flagsize;
+	unsigned long maxjiff = jiffies + 3*HZ;
+
+restart:
+	idx = ap->tx_prd;
+
+	if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+		goto overflow;
+
+	if (!skb_shinfo(skb)->nr_frags)	{
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, skb, idx);
+		flagsize = (skb->len << 16) | (BD_FLG_END);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+		desc = ap->tx_ring + idx;
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		/* Look at ace_tx_int for explanations. */
+		if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+			flagsize |= BD_FLG_COAL_NOW;
+
+		ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+	} else {
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+		int i, len = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, NULL, idx);
+		flagsize = (skb_headlen(skb) << 16);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+
+		ace_load_tx_bd(ap, ap->tx_ring + idx, mapping, flagsize, vlan_tag);
+
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct tx_ring_info *info;
+
+			len += frag->size;
+			info = ap->skb->tx_skbuff + idx;
+			desc = ap->tx_ring + idx;
+
+			mapping = pci_map_page(ap->pdev, frag->page,
+					       frag->page_offset, frag->size,
+					       PCI_DMA_TODEVICE);
+
+			flagsize = (frag->size << 16);
+			if (skb->ip_summed == CHECKSUM_HW)
+				flagsize |= BD_FLG_TCP_UDP_SUM;
+			idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+			if (i == skb_shinfo(skb)->nr_frags - 1) {
+				flagsize |= BD_FLG_END;
+				if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+					flagsize |= BD_FLG_COAL_NOW;
+
+				/*
+				 * Only the last fragment frees
+				 * the skb!
+				 */
+				info->skb = skb;
+			} else {
+				info->skb = NULL;
+			}
+			pci_unmap_addr_set(info, mapping, mapping);
+			pci_unmap_len_set(info, maplen, frag->size);
+			ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+		}
+	}
+
+ 	wmb();
+ 	ap->tx_prd = idx;
+ 	ace_set_txprd(regs, ap, idx);
+
+	if (flagsize & BD_FLG_COAL_NOW) {
+		netif_stop_queue(dev);
+
+		/*
+		 * A TX-descriptor producer (an IRQ) might have gotten
+		 * inbetween, making the ring free again. Since xmit is
+		 * serialized, this is the only situation we have to
+		 * re-test.
+		 */
+		if (!tx_ring_full(ap, ap->tx_ret_csm, idx))
+			netif_wake_queue(dev);
+	}
+
+	dev->trans_start = jiffies;
+	return NETDEV_TX_OK;
+
+overflow:
+	/*
+	 * This race condition is unavoidable with lock-free drivers.
+	 * We wake up the queue _before_ tx_prd is advanced, so that we can
+	 * enter hard_start_xmit too early, while tx ring still looks closed.
+	 * This happens ~1-4 times per 100000 packets, so that we can allow
+	 * to loop syncing to other CPU. Probably, we need an additional
+	 * wmb() in ace_tx_intr as well.
+	 *
+	 * Note that this race is relieved by reserving one more entry
+	 * in tx ring than it is necessary (see original non-SG driver).
+	 * However, with SG we need to reserve 2*MAX_SKB_FRAGS+1, which
+	 * is already overkill.
+	 *
+	 * Alternative is to return with 1 not throttling queue. In this
+	 * case loop becomes longer, no more useful effects.
+	 */
+	if (time_before(jiffies, maxjiff)) {
+		barrier();
+		cpu_relax();
+		goto restart;
+	}
+	
+	/* The ring is stuck full. */
+	printk(KERN_WARNING "%s: Transmit ring stuck full\n", dev->name);
+	return NETDEV_TX_BUSY;
+}
+
+
+static int ace_change_mtu(struct net_device *dev, int new_mtu)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+
+	if (new_mtu > ACE_JUMBO_MTU)
+		return -EINVAL;
+
+	writel(new_mtu + ETH_HLEN + 4, &regs->IfMtu);
+	dev->mtu = new_mtu;
+
+	if (new_mtu > ACE_STD_MTU) {
+		if (!(ap->jumbo)) {
+			printk(KERN_INFO "%s: Enabling Jumbo frame "
+			       "support\n", dev->name);
+			ap->jumbo = 1;
+			if (!test_and_set_bit(0, &ap->jumbo_refill_busy))
+				ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+			ace_set_rxtx_parms(dev, 1);
+		}
+	} else {
+		while (test_and_set_bit(0, &ap->jumbo_refill_busy));
+		ace_sync_irq(dev->irq);
+		ace_set_rxtx_parms(dev, 0);
+		if (ap->jumbo) {
+			struct cmd cmd;
+
+			cmd.evt = C_RESET_JUMBO_RNG;
+			cmd.code = 0;
+			cmd.idx = 0;
+			ace_issue_cmd(regs, &cmd);
+		}
+	}
+
+	return 0;
+}
+
+static int ace_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link;
+
+	memset(ecmd, 0, sizeof(struct ethtool_cmd));
+	ecmd->supported =
+		(SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+		 SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+		 SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+		 SUPPORTED_Autoneg | SUPPORTED_FIBRE);
+
+	ecmd->port = PORT_FIBRE;
+	ecmd->transceiver = XCVR_INTERNAL;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		ecmd->speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			ecmd->speed = SPEED_100;
+		else if (link & LNK_10MB)
+			ecmd->speed = SPEED_10;
+		else
+			ecmd->speed = 0;
+	}
+	if (link & LNK_FULL_DUPLEX)
+		ecmd->duplex = DUPLEX_FULL;
+	else
+		ecmd->duplex = DUPLEX_HALF;
+
+	if (link & LNK_NEGOTIATE)
+		ecmd->autoneg = AUTONEG_ENABLE;
+	else
+		ecmd->autoneg = AUTONEG_DISABLE;
+
+#if 0
+	/*
+	 * Current struct ethtool_cmd is insufficient
+	 */
+	ecmd->trace = readl(&regs->TuneTrace);
+
+	ecmd->txcoal = readl(&regs->TuneTxCoalTicks);
+	ecmd->rxcoal = readl(&regs->TuneRxCoalTicks);
+#endif
+	ecmd->maxtxpkt = readl(&regs->TuneMaxTxDesc);
+	ecmd->maxrxpkt = readl(&regs->TuneMaxRxDesc);
+
+	return 0;
+}
+
+static int ace_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link, speed;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			speed = SPEED_100;
+		else if (link & LNK_10MB)
+			speed = SPEED_10;
+		else
+			speed = SPEED_100;
+	}
+
+	link = LNK_ENABLE | LNK_1000MB | LNK_100MB | LNK_10MB |
+		LNK_RX_FLOW_CTL_Y | LNK_NEG_FCTL;
+	if (!ACE_IS_TIGON_I(ap))
+		link |= LNK_TX_FLOW_CTL_Y;
+	if (ecmd->autoneg == AUTONEG_ENABLE)
+		link |= LNK_NEGOTIATE;
+	if (ecmd->speed != speed) #ifdef DEBUG
+					printk("low on mini buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_mini_rx_ring(ap, RX_MINI_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+
+		if (ap->jumbo) {
+			cur_size = atomic_read(&ap->cur_jumbo_bufs);
+			if (cur_size < RX_LOW_JUMBO_THRES) {
+				if ((cur_size < RX_PANIC_JUMBO_THRES) &&
+				    !test_and_set_bit(0,
+						      &ap->jumbo_refill_busy)){
+#ifdef DEBUG
+					printk("low on jumbo buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+		if (run_tasklet && !ap->tasklet_pending) {
+			ap->tasklet_pending = 1;
+			tasklet_schedule(&ap->ace_tasklet);
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+
+#if ACENIC_DO_VLAN
+static void ace_vlan_rx_register(struct net_device *dev, struct vlan_group *grp)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	ap->vlgrp = grp;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+
+
+static void ace_vlan_rx_kill_vid(struct net_device *dev, unsigned short vid)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	if (ap->vlgrp)
+		ap->vlgrp->vlan_devices[vid] = NULL;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+#endif /* ACENIC_DO_VLAN */
+
+
+static int ace_open(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+
+	if (!(ap->fw_running)) {
+		printk(KERN_WARNING "%s: Firmware not running!\n", dev->name);
+		return -EBUSY;
+	}
+
+	writel(dev->mtu + ETH_HLEN + 4, &regs->IfMtu);
+
+	cmd.evt = C_CLEAR_STATS;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_UP;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	if (ap->jumbo &&
+	    !test_and_set_bit(0, &ap->jumbo_refill_busy))
+		ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+
+	if (dev->flags & IFF_PROMISC) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_ENABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+
+		ap->promisc = 1;
+	}else
+		ap->promisc = 0;
+	ap->mcast_all = 0;
+
+#if 0
+	cmd.evt = C_LNK_NEGOTIATION;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+#endif
+
+	netif_start_queue(dev);
+
+	/*
+	 * Setup the bottom half rx ring refill handler
+	 */
+	tasklet_init(&ap->ace_tasklet, ace_tasklet, (unsigned long)dev);
+	return 0;
+}
+
+
+static int ace_close(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+	unsigned long flags;
+	short i;
+
+	/*
+	 * Without (or before) releasing irq and stopping hardware, this
+	 * is an absolute non-sense, by the way. It will be reset instantly
+	 * by the first irq.
+	 */
+	netif_stop_queue(dev);
+
+	
+	if (ap->promisc) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_DISABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+		ap->promisc = 0;
+	}
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_DOWN;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	tasklet_kill(&ap->ace_tasklet);
+
+	/*
+	 * Make sure one CPU is not processing packets while
+	 * buffers are being released by another.
+	 */
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	for (i = 0; i < ACE_TX_RING_ENTRIES(ap); i++) {
+		struct sk_buff *skb;
+		dma_addr_t mapping;
+		struct tx_ring_info *info;
+
+		info = ap->skb->tx_skbuff + i;
+		skb = info->skb;
+		mapping = pci_unmap_addr(info, mapping);
+
+		if (mapping) {
+			if (ACE_IS_TIGON_I(ap)) {
+				struct tx_desc __iomem *tx 
+					= (struct tx_desc __iomem *) &ap->tx_ring[i];
+				writel(0, &tx->addr.addrhi);
+				writel(0, &tx->addr.addrlo);
+				writel(0, &tx->flagsize);
+			} else
+				memset(ap->tx_ring + i, 0,
+				       sizeof(struct tx_desc));
+			pci_unmap_page(ap->pdev, mapping,
+				       pci_unmap_len(info, maplen),
+				       PCI_DMA_TODEVICE);
+			pci_unmap_addr_set(info, mapping, 0);
+		}
+		if (skb) {
+			dev_kfree_skb(skb);
+			info->skb = NULL;
+		}
+	}
+
+	if (ap->jumbo) {
+		cmd.evt = C_RESET_JUMBO_RNG;
+		cmd.code = 0;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+	}
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+
+	return 0;
+}
+
+
+static inline dma_addr_t
+ace_map_tx_skb(struct ace_private *ap, struct sk_buff *skb,
+	       struct sk_buff *tail, u32 idx)
+{
+	dma_addr_t mapping;
+	struct tx_ring_info *info;
+
+	mapping = pci_map_page(ap->pdev, virt_to_page(skb->data),
+			       offset_in_page(skb->data),
+			       skb->len, PCI_DMA_TODEVICE);
+
+	info = ap->skb->tx_skbuff + idx;
+	info->skb = tail;
+	pci_unmap_addr_set(info, mapping, mapping);
+	pci_unmap_len_set(info, maplen, skb->len);
+	return mapping;
+}
+
+
+static inline void
+ace_load_tx_bd(struct ace_private *ap, struct tx_desc *desc, u64 addr,
+	       u32 flagsize, u32 vlan_tag)
+{
+#if !USE_TX_COAL_NOW
+	flagsize &= ~BD_FLG_COAL_NOW;
+#endif
+
+	if (ACE_IS_TIGON_I(ap)) {
+		struct tx_desc __iomem *io = (struct tx_desc __iomem *) desc;
+		writel(addr >> 32, &io->addr.addrhi);
+		writel(addr & 0xffffffff, &io->addr.addrlo);
+		writel(flagsize, &io->flagsize);
+#if ACENIC_DO_VLAN
+		writel(vlan_tag, &io->vlanres);
+#endif
+	} else {
+		desc->addr.addrhi = addr >> 32;
+		desc->addr.addrlo = addr;
+		desc->flagsize = flagsize;
+#if ACENIC_DO_VLAN
+		desc->vlanres = vlan_tag;
+#endif
+	}
+}
+
+
+static int ace_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct tx_desc *desc;
+	u32 idx, flagsize;
+	unsigned long maxjiff = jiffies + 3*HZ;
+
+restart:
+	idx = ap->tx_prd;
+
+	if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+		goto overflow;
+
+	if (!skb_shinfo(skb)->nr_frags)	{
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, skb, idx);
+		flagsize = (skb->len << 16) | (BD_FLG_END);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+		desc = ap->tx_ring + idx;
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		/* Look at ace_tx_int for explanations. */
+		if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+			flagsize |= BD_FLG_COAL_NOW;
+
+		ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+	} else {
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+		int i, len = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, NULL, idx);
+		flagsize = (skb_headlen(skb) << 16);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+
+		ace_load_tx_bd(ap, ap->tx_ring + idx, mapping, flagsize, vlan_tag);
+
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct tx_ring_info *info;
+
+			len += frag->size;
+			info = ap->skb->tx_skbuff + idx;
+			desc = ap->tx_ring + idx;
+
+			mapping = pci_map_page(ap->pdev, frag->page,
+					       frag->page_offset, frag->size,
+					       PCI_DMA_TODEVICE);
+
+			flagsize = (frag->size << 16);
+			if (skb->ip_summed == CHECKSUM_HW)
+				flagsize |= BD_FLG_TCP_UDP_SUM;
+			idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+			if (i == skb_shinfo(skb)->nr_frags - 1) {
+				flagsize |= BD_FLG_END;
+				if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+					flagsize |= BD_FLG_COAL_NOW;
+
+				/*
+				 * Only the last fragment frees
+				 * the skb!
+				 */
+				info->skb = skb;
+			} else {
+				info->skb = NULL;
+			}
+			pci_unmap_addr_set(info, mapping, mapping);
+			pci_unmap_len_set(info, maplen, frag->size);
+			ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+		}
+	}
+
+ 	wmb();
+ 	ap->tx_prd = idx;
+ 	ace_set_txprd(regs, ap, idx);
+
+	if (flagsize & BD_FLG_COAL_NOW) {
+		netif_stop_queue(dev);
+
+		/*
+		 * A TX-descriptor producer (an IRQ) might have gotten
+		 * inbetween, making the ring free again. Since xmit is
+		 * serialized, this is the only situation we have to
+		 * re-test.
+		 */
+		if (!tx_ring_full(ap, ap->tx_ret_csm, idx))
+			netif_wake_queue(dev);
+	}
+
+	dev->trans_start = jiffies;
+	return NETDEV_TX_OK;
+
+overflow:
+	/*
+	 * This race condition is unavoidable with lock-free drivers.
+	 * We wake up the queue _before_ tx_prd is advanced, so that we can
+	 * enter hard_start_xmit too early, while tx ring still looks closed.
+	 * This happens ~1-4 times per 100000 packets, so that we can allow
+	 * to loop syncing to other CPU. Probably, we need an additional
+	 * wmb() in ace_tx_intr as well.
+	 *
+	 * Note that this race is relieved by reserving one more entry
+	 * in tx ring than it is necessary (see original non-SG driver).
+	 * However, with SG we need to reserve 2*MAX_SKB_FRAGS+1, which
+	 * is already overkill.
+	 *
+	 * Alternative is to return with 1 not throttling queue. In this
+	 * case loop becomes longer, no more useful effects.
+	 */
+	if (time_before(jiffies, maxjiff)) {
+		barrier();
+		cpu_relax();
+		goto restart;
+	}
+	
+	/* The ring is stuck full. */
+	printk(KERN_WARNING "%s: Transmit ring stuck full\n", dev->name);
+	return NETDEV_TX_BUSY;
+}
+
+
+static int ace_change_mtu(struct net_device *dev, int new_mtu)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+
+	if (new_mtu > ACE_JUMBO_MTU)
+		return -EINVAL;
+
+	writel(new_mtu + ETH_HLEN + 4, &regs->IfMtu);
+	dev->mtu = new_mtu;
+
+	if (new_mtu > ACE_STD_MTU) {
+		if (!(ap->jumbo)) {
+			printk(KERN_INFO "%s: Enabling Jumbo frame "
+			       "support\n", dev->name);
+			ap->jumbo = 1;
+			if (!test_and_set_bit(0, &ap->jumbo_refill_busy))
+				ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+			ace_set_rxtx_parms(dev, 1);
+		}
+	} else {
+		while (test_and_set_bit(0, &ap->jumbo_refill_busy));
+		ace_sync_irq(dev->irq);
+		ace_set_rxtx_parms(dev, 0);
+		if (ap->jumbo) {
+			struct cmd cmd;
+
+			cmd.evt = C_RESET_JUMBO_RNG;
+			cmd.code = 0;
+			cmd.idx = 0;
+			ace_issue_cmd(regs, &cmd);
+		}
+	}
+
+	return 0;
+}
+
+static int ace_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link;
+
+	memset(ecmd, 0, sizeof(struct ethtool_cmd));
+	ecmd->supported =
+		(SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+		 SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+		 SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+		 SUPPORTED_Autoneg | SUPPORTED_FIBRE);
+
+	ecmd->port = PORT_FIBRE;
+	ecmd->transceiver = XCVR_INTERNAL;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		ecmd->speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			ecmd->speed = SPEED_100;
+		else if (link & LNK_10MB)
+			ecmd->speed = SPEED_10;
+		else
+			ecmd->speed = 0;
+	}
+	if (link & LNK_FULL_DUPLEX)
+		ecmd->duplex = DUPLEX_FULL;
+	else
+		ecmd->duplex = DUPLEX_HALF;
+
+	if (link & LNK_NEGOTIATE)
+		ecmd->autoneg = AUTONEG_ENABLE;
+	else
+		ecmd->autoneg = AUTONEG_DISABLE;
+
+#if 0
+	/*
+	 * Current struct ethtool_cmd is insufficient
+	 */
+	ecmd->trace = readl(&regs->TuneTrace);
+
+	ecmd->txcoal = readl(&regs->TuneTxCoalTicks);
+	ecmd->rxcoal = readl(&regs->TuneRxCoalTicks);
+#endif
+	ecmd->maxtxpkt = readl(&regs->TuneMaxTxDesc);
+	ecmd->maxrxpkt = readl(&regs->TuneMaxRxDesc);
+
+	return 0;
+}
+
+static int ace_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link, speed;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			speed = SPEED_100;
+		else if (link & LNK_10MB)
+			speed = SPEED_10;
+		else
+			speed = SPEED_100;
+	}
+
+	link = LNK_ENABLE | LNK_1000MB | LNK_100MB | LNK_10MB |
+		LNK_RX_FLOW_CTL_Y | LNK_NEG_FCTL;
+	if (!ACE_IS_TIGON_I(ap))
+		link |= LNK_TX_FLOW_CTL_Y;
+	if (ecmd->autoneg == AUTONEG_ENABLE)
+		link |= LNK_NEGOTIATE;
+	if (ecmd->speed != speed) #ifdef DEBUG
+					printk("low on mini buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_mini_rx_ring(ap, RX_MINI_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+
+		if (ap->jumbo) {
+			cur_size = atomic_read(&ap->cur_jumbo_bufs);
+			if (cur_size < RX_LOW_JUMBO_THRES) {
+				if ((cur_size < RX_PANIC_JUMBO_THRES) &&
+				    !test_and_set_bit(0,
+						      &ap->jumbo_refill_busy)){
+#ifdef DEBUG
+					printk("low on jumbo buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+		if (run_tasklet && !ap->tasklet_pending) {
+			ap->tasklet_pending = 1;
+			tasklet_schedule(&ap->ace_tasklet);
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+
+#if ACENIC_DO_VLAN
+static void ace_vlan_rx_register(struct net_device *dev, struct vlan_group *grp)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	ap->vlgrp = grp;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+
+
+static void ace_vlan_rx_kill_vid(struct net_device *dev, unsigned short vid)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	if (ap->vlgrp)
+		ap->vlgrp->vlan_devices[vid] = NULL;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+#endif /* ACENIC_DO_VLAN */
+
+
+static int ace_open(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+
+	if (!(ap->fw_running)) {
+		printk(KERN_WARNING "%s: Firmware not running!\n", dev->name);
+		return -EBUSY;
+	}
+
+	writel(dev->mtu + ETH_HLEN + 4, &regs->IfMtu);
+
+	cmd.evt = C_CLEAR_STATS;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_UP;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	if (ap->jumbo &&
+	    !test_and_set_bit(0, &ap->jumbo_refill_busy))
+		ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+
+	if (dev->flags & IFF_PROMISC) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_ENABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+
+		ap->promisc = 1;
+	}else
+		ap->promisc = 0;
+	ap->mcast_all = 0;
+
+#if 0
+	cmd.evt = C_LNK_NEGOTIATION;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+#endif
+
+	netif_start_queue(dev);
+
+	/*
+	 * Setup the bottom half rx ring refill handler
+	 */
+	tasklet_init(&ap->ace_tasklet, ace_tasklet, (unsigned long)dev);
+	return 0;
+}
+
+
+static int ace_close(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+	unsigned long flags;
+	short i;
+
+	/*
+	 * Without (or before) releasing irq and stopping hardware, this
+	 * is an absolute non-sense, by the way. It will be reset instantly
+	 * by the first irq.
+	 */
+	netif_stop_queue(dev);
+
+	
+	if (ap->promisc) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_DISABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+		ap->promisc = 0;
+	}
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_DOWN;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	tasklet_kill(&ap->ace_tasklet);
+
+	/*
+	 * Make sure one CPU is not processing packets while
+	 * buffers are being released by another.
+	 */
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	for (i = 0; i < ACE_TX_RING_ENTRIES(ap); i++) {
+		struct sk_buff *skb;
+		dma_addr_t mapping;
+		struct tx_ring_info *info;
+
+		info = ap->skb->tx_skbuff + i;
+		skb = info->skb;
+		mapping = pci_unmap_addr(info, mapping);
+
+		if (mapping) {
+			if (ACE_IS_TIGON_I(ap)) {
+				struct tx_desc __iomem *tx 
+					= (struct tx_desc __iomem *) &ap->tx_ring[i];
+				writel(0, &tx->addr.addrhi);
+				writel(0, &tx->addr.addrlo);
+				writel(0, &tx->flagsize);
+			} else
+				memset(ap->tx_ring + i, 0,
+				       sizeof(struct tx_desc));
+			pci_unmap_page(ap->pdev, mapping,
+				       pci_unmap_len(info, maplen),
+				       PCI_DMA_TODEVICE);
+			pci_unmap_addr_set(info, mapping, 0);
+		}
+		if (skb) {
+			dev_kfree_skb(skb);
+			info->skb = NULL;
+		}
+	}
+
+	if (ap->jumbo) {
+		cmd.evt = C_RESET_JUMBO_RNG;
+		cmd.code = 0;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+	}
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+
+	return 0;
+}
+
+
+static inline dma_addr_t
+ace_map_tx_skb(struct ace_private *ap, struct sk_buff *skb,
+	       struct sk_buff *tail, u32 idx)
+{
+	dma_addr_t mapping;
+	struct tx_ring_info *info;
+
+	mapping = pci_map_page(ap->pdev, virt_to_page(skb->data),
+			       offset_in_page(skb->data),
+			       skb->len, PCI_DMA_TODEVICE);
+
+	info = ap->skb->tx_skbuff + idx;
+	info->skb = tail;
+	pci_unmap_addr_set(info, mapping, mapping);
+	pci_unmap_len_set(info, maplen, skb->len);
+	return mapping;
+}
+
+
+static inline void
+ace_load_tx_bd(struct ace_private *ap, struct tx_desc *desc, u64 addr,
+	       u32 flagsize, u32 vlan_tag)
+{
+#if !USE_TX_COAL_NOW
+	flagsize &= ~BD_FLG_COAL_NOW;
+#endif
+
+	if (ACE_IS_TIGON_I(ap)) {
+		struct tx_desc __iomem *io = (struct tx_desc __iomem *) desc;
+		writel(addr >> 32, &io->addr.addrhi);
+		writel(addr & 0xffffffff, &io->addr.addrlo);
+		writel(flagsize, &io->flagsize);
+#if ACENIC_DO_VLAN
+		writel(vlan_tag, &io->vlanres);
+#endif
+	} else {
+		desc->addr.addrhi = addr >> 32;
+		desc->addr.addrlo = addr;
+		desc->flagsize = flagsize;
+#if ACENIC_DO_VLAN
+		desc->vlanres = vlan_tag;
+#endif
+	}
+}
+
+
+static int ace_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct tx_desc *desc;
+	u32 idx, flagsize;
+	unsigned long maxjiff = jiffies + 3*HZ;
+
+restart:
+	idx = ap->tx_prd;
+
+	if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+		goto overflow;
+
+	if (!skb_shinfo(skb)->nr_frags)	{
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, skb, idx);
+		flagsize = (skb->len << 16) | (BD_FLG_END);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+		desc = ap->tx_ring + idx;
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		/* Look at ace_tx_int for explanations. */
+		if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+			flagsize |= BD_FLG_COAL_NOW;
+
+		ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+	} else {
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+		int i, len = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, NULL, idx);
+		flagsize = (skb_headlen(skb) << 16);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+
+		ace_load_tx_bd(ap, ap->tx_ring + idx, mapping, flagsize, vlan_tag);
+
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct tx_ring_info *info;
+
+			len += frag->size;
+			info = ap->skb->tx_skbuff + idx;
+			desc = ap->tx_ring + idx;
+
+			mapping = pci_map_page(ap->pdev, frag->page,
+					       frag->page_offset, frag->size,
+					       PCI_DMA_TODEVICE);
+
+			flagsize = (frag->size << 16);
+			if (skb->ip_summed == CHECKSUM_HW)
+				flagsize |= BD_FLG_TCP_UDP_SUM;
+			idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+			if (i == skb_shinfo(skb)->nr_frags - 1) {
+				flagsize |= BD_FLG_END;
+				if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+					flagsize |= BD_FLG_COAL_NOW;
+
+				/*
+				 * Only the last fragment frees
+				 * the skb!
+				 */
+				info->skb = skb;
+			} else {
+				info->skb = NULL;
+			}
+			pci_unmap_addr_set(info, mapping, mapping);
+			pci_unmap_len_set(info, maplen, frag->size);
+			ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+		}
+	}
+
+ 	wmb();
+ 	ap->tx_prd = idx;
+ 	ace_set_txprd(regs, ap, idx);
+
+	if (flagsize & BD_FLG_COAL_NOW) {
+		netif_stop_queue(dev);
+
+		/*
+		 * A TX-descriptor producer (an IRQ) might have gotten
+		 * inbetween, making the ring free again. Since xmit is
+		 * serialized, this is the only situation we have to
+		 * re-test.
+		 */
+		if (!tx_ring_full(ap, ap->tx_ret_csm, idx))
+			netif_wake_queue(dev);
+	}
+
+	dev->trans_start = jiffies;
+	return NETDEV_TX_OK;
+
+overflow:
+	/*
+	 * This race condition is unavoidable with lock-free drivers.
+	 * We wake up the queue _before_ tx_prd is advanced, so that we can
+	 * enter hard_start_xmit too early, while tx ring still looks closed.
+	 * This happens ~1-4 times per 100000 packets, so that we can allow
+	 * to loop syncing to other CPU. Probably, we need an additional
+	 * wmb() in ace_tx_intr as well.
+	 *
+	 * Note that this race is relieved by reserving one more entry
+	 * in tx ring than it is necessary (see original non-SG driver).
+	 * However, with SG we need to reserve 2*MAX_SKB_FRAGS+1, which
+	 * is already overkill.
+	 *
+	 * Alternative is to return with 1 not throttling queue. In this
+	 * case loop becomes longer, no more useful effects.
+	 */
+	if (time_before(jiffies, maxjiff)) {
+		barrier();
+		cpu_relax();
+		goto restart;
+	}
+	
+	/* The ring is stuck full. */
+	printk(KERN_WARNING "%s: Transmit ring stuck full\n", dev->name);
+	return NETDEV_TX_BUSY;
+}
+
+
+static int ace_change_mtu(struct net_device *dev, int new_mtu)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+
+	if (new_mtu > ACE_JUMBO_MTU)
+		return -EINVAL;
+
+	writel(new_mtu + ETH_HLEN + 4, &regs->IfMtu);
+	dev->mtu = new_mtu;
+
+	if (new_mtu > ACE_STD_MTU) {
+		if (!(ap->jumbo)) {
+			printk(KERN_INFO "%s: Enabling Jumbo frame "
+			       "support\n", dev->name);
+			ap->jumbo = 1;
+			if (!test_and_set_bit(0, &ap->jumbo_refill_busy))
+				ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+			ace_set_rxtx_parms(dev, 1);
+		}
+	} else {
+		while (test_and_set_bit(0, &ap->jumbo_refill_busy));
+		ace_sync_irq(dev->irq);
+		ace_set_rxtx_parms(dev, 0);
+		if (ap->jumbo) {
+			struct cmd cmd;
+
+			cmd.evt = C_RESET_JUMBO_RNG;
+			cmd.code = 0;
+			cmd.idx = 0;
+			ace_issue_cmd(regs, &cmd);
+		}
+	}
+
+	return 0;
+}
+
+static int ace_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link;
+
+	memset(ecmd, 0, sizeof(struct ethtool_cmd));
+	ecmd->supported =
+		(SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+		 SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+		 SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+		 SUPPORTED_Autoneg | SUPPORTED_FIBRE);
+
+	ecmd->port = PORT_FIBRE;
+	ecmd->transceiver = XCVR_INTERNAL;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		ecmd->speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			ecmd->speed = SPEED_100;
+		else if (link & LNK_10MB)
+			ecmd->speed = SPEED_10;
+		else
+			ecmd->speed = 0;
+	}
+	if (link & LNK_FULL_DUPLEX)
+		ecmd->duplex = DUPLEX_FULL;
+	else
+		ecmd->duplex = DUPLEX_HALF;
+
+	if (link & LNK_NEGOTIATE)
+		ecmd->autoneg = AUTONEG_ENABLE;
+	else
+		ecmd->autoneg = AUTONEG_DISABLE;
+
+#if 0
+	/*
+	 * Current struct ethtool_cmd is insufficient
+	 */
+	ecmd->trace = readl(&regs->TuneTrace);
+
+	ecmd->txcoal = readl(&regs->TuneTxCoalTicks);
+	ecmd->rxcoal = readl(&regs->TuneRxCoalTicks);
+#endif
+	ecmd->maxtxpkt = readl(&regs->TuneMaxTxDesc);
+	ecmd->maxrxpkt = readl(&regs->TuneMaxRxDesc);
+
+	return 0;
+}
+
+static int ace_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link, speed;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			speed = SPEED_100;
+		else if (link & LNK_10MB)
+			speed = SPEED_10;
+		else
+			speed = SPEED_100;
+	}
+
+	link = LNK_ENABLE | LNK_1000MB | LNK_100MB | LNK_10MB |
+		LNK_RX_FLOW_CTL_Y | LNK_NEG_FCTL;
+	if (!ACE_IS_TIGON_I(ap))
+		link |= LNK_TX_FLOW_CTL_Y;
+	if (ecmd->autoneg == AUTONEG_ENABLE)
+		link |= LNK_NEGOTIATE;
+	if (ecmd->speed != speed) 
+    mapping = ace_map_tx_skb(ap, skb, NULL, idx);
+		flagsize = (skb_headlen(skb) << 16);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+
+		ace_load_tx_bd(ap, ap->tx_ring + idx, mapping, flagsize, vlan_tag);
+
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct tx_ring_info *info;
+
+			len += frag->size;
+			info = ap->skb->tx_skbuff + idx;
+			desc = ap->tx_ring + idx;
+
+			mapping = pci_map_page(ap->pdev, frag->page,
+					       frag->page_offset, frag->size,
+					       PCI_DMA_TODEVICE);
+
+			flagsize = (frag->size << 16);
+			if (skb->ip_summed == CHECKSUM_HW)
+				flagsize |= BD_FLG_TCP_UDP_SUM;
+			idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+			if (i == skb_shinfo(skb)->nr_frags - 1) {
+				flagsize |= BD_FLG_END;
+				if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+					flagsize |= BD_FLG_COAL_NOW;
+
+				/*
+				 * Only the last fragment frees
+				 * the skb!
+				 */
+				info->skb = skb;
+			} else {
+				info->skb = NULL;
+			}
+			pci_unmap_addr_set(info, mapping, mapping);
+			pci_unmap_len_set(info, maplen, frag->size);
+			ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+		}
+	}
+
+ 	wmb();
+ 	ap->tx_prd = idx;
+ 	ace_set_txprd(regs, ap, idx);
+
+	if (flagsize & BD_FLG_COAL_NOW) {
+		netif_stop_queue(dev);
+
+		/*
+		 * A TX-descriptor producer (an IRQ) might have gotten
+		 * inbetween, making the ring free again. Since xmit is
+		 * serialized, this is the only situation we have to
+		 * re-test.
+		 */
+		if (!tx_ring_full(ap, ap->tx_ret_csm, idx))
+			netif_wake_queue(dev);
+	}
+
+	dev->trans_start = jiffies;
+	return NETDEV_TX_OK;
+
+overflow:
+	/*
+	 * This race condition is unavoidable with lock-free drivers.
+	 * We wake up the queue _before_ tx_prd is advanced, so that we can
+	 * enter hard_start_xmit too early, while tx ring still looks closed.
+	 * This happens ~1-4 times per 100000 packets, so that we can allow
+	 * to loop syncing to other CPU. Probably, we need an additional
+	 * wmb() in ace_tx_intr as well.
+	 *
+	 * Note that this race is relieved by reserving one more entry
+	 * in tx ring than it is necessary (see original non-SG driver).
+	 * However, with SG we need to reserve 2*MAX_SKB_FRAGS+1, which
+	 * is already overkill.
+	 *
+	 * Alternative is to return with 1 not throttling queue. In this
+	 * case loop becomes longer, no more useful effects.
+	 */
+	if (time_before(jiffies, maxjiff)) {
+		barrier();
+		cpu_relax();
+		goto restart;
+	}
+	
+	/* The ring is stuck full. */
+	printk(KERN_WARNING "%s: Transmit ring stuck full\n", dev->name);
+	return NETDEV_TX_BUSY;
+}
+
+
+static int ace_change_mtu(struct net_device *dev, int new_mtu)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+
+	if (new_mtu > ACE_JUMBO_MTU)
+		return -EINVAL;
+
+	writel(new_mtu + ETH_HLEN + 4, &regs->IfMtu);
+	dev->mtu = new_mtu;
+
+	if (new_mtu > ACE_STD_MTU) {
+		if (!(ap->jumbo)) {
+			printk(KERN_INFO "%s: Enabling Jumbo frame "
+			       "support\n", dev->name);
+			ap->jumbo = 1;
+			if (!test_and_set_bit(0, &ap->jumbo_refill_busy))
+				ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+			ace_set_rxtx_parms(dev, 1);
+		}
+	} else {
+		while (test_and_set_bit(0, &ap->jumbo_refill_busy));
+		ace_sync_irq(dev->irq);
+		ace_set_rxtx_parms(dev, 0);
+		if (ap->jumbo) {
+			struct cmd cmd;
+
+			cmd.evt = C_RESET_JUMBO_RNG;
+			cmd.code = 0;
+			cmd.idx = 0;
+			ace_issue_cmd(regs, &cmd);
+		}
+	}
+
+	return 0;
+}
+
+static int ace_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link;
+
+	memset(ecmd, 0, sizeof(struct ethtool_cmd));
+	ecmd->supported =
+		(SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+		 SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+		 SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+		 SUPPORTED_Autoneg | SUPPORTED_FIBRE);
+
+	ecmd->port = PORT_FIBRE;
+	ecmd->transceiver = XCVR_INTERNAL;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		ecmd->speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			ecmd->speed = SPEED_100;
+		else if (link & LNK_10MB)
+			ecmd->speed = SPEED_10;
+		else
+			ecmd->speed = 0;
+	}
+	if (link & LNK_FULL_DUPLEX)
+		ecmd->duplex = DUPLEX_FULL;
+	else
+		ecmd->duplex = DUPLEX_HALF;
+
+	if (link & LNK_NEGOTIATE)
+		ecmd->autoneg = AUTONEG_ENABLE;
+	else
+		ecmd->autoneg = AUTONEG_DISABLE;
+
+#if 0
+	/*
+	 * Current struct ethtool_cmd is insufficient
+	 */
+	ecmd->trace = readl(&regs->TuneTrace);
+
+	ecmd->txcoal = readl(&regs->TuneTxCoalTicks);
+	ecmd->rxcoal = readl(&regs->TuneRxCoalTicks);
+#endif
+	ecmd->maxtxpkt = readl(&regs->TuneMaxTxDesc);
+	ecmd->maxrxpkt = readl(&regs->TuneMaxRxDesc);
+
+	return 0;
+}
+
+static int ace_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link, speed;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			speed = SPEED_100;
+		else if (link & LNK_10MB)
+			speed = SPEED_10;
+		else
+			speed = SPEED_100;
+	}
+
+	link = LNK_ENABLE | LNK_1000MB | LNK_100MB | LNK_10MB |
+		LNK_RX_FLOW_CTL_Y | LNK_NEG_FCTL;
+	if (!ACE_IS_TIGON_I(ap))
+		link |= LNK_TX_FLOW_CTL_Y;
+	if (ecmd->autoneg == AUTONEG_ENABLE)
+		link |= LNK_NEGOTIATE;
+	if (ecmd->speed != speed) 
+#ifdef DEBUG
+					printk("low on mini buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_mini_rx_ring(ap, RX_MINI_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+
+		if (ap->jumbo) {
+			cur_size = atomic_read(&ap->cur_jumbo_bufs);
+			if (cur_size < RX_LOW_JUMBO_THRES) {
+				if ((cur_size < RX_PANIC_JUMBO_THRES) &&
+				    !test_and_set_bit(0,
+						      &ap->jumbo_refill_busy)){
+#ifdef DEBUG
+					printk("low on jumbo buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+		if (run_tasklet && !ap->tasklet_pending) {
+			ap->tasklet_pending = 1;
+			tasklet_schedule(&ap->ace_tasklet);
+		}
+	}
+
+	return IRQ_HANDLED;
+}
+
+
+#if ACENIC_DO_VLAN
+static void ace_vlan_rx_register(struct net_device *dev, struct vlan_group *grp)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	ap->vlgrp = grp;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+
+
+static void ace_vlan_rx_kill_vid(struct net_device *dev, unsigned short vid)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	unsigned long flags;
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	if (ap->vlgrp)
+		ap->vlgrp->vlan_devices[vid] = NULL;
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+}
+#endif /* ACENIC_DO_VLAN */
+
+
+static int ace_open(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+
+	if (!(ap->fw_running)) {
+		printk(KERN_WARNING "%s: Firmware not running!\n", dev->name);
+		return -EBUSY;
+	}
+
+	writel(dev->mtu + ETH_HLEN + 4, &regs->IfMtu);
+
+	cmd.evt = C_CLEAR_STATS;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_UP;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	if (ap->jumbo &&
+	    !test_and_set_bit(0, &ap->jumbo_refill_busy))
+		ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+
+	if (dev->flags & IFF_PROMISC) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_ENABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+
+		ap->promisc = 1;
+	}else
+		ap->promisc = 0;
+	ap->mcast_all = 0;
+
+#if 0
+	cmd.evt = C_LNK_NEGOTIATION;
+	cmd.code = 0;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+#endif
+
+	netif_start_queue(dev);
+
+	/*
+	 * Setup the bottom half rx ring refill handler
+	 */
+	tasklet_init(&ap->ace_tasklet, ace_tasklet, (unsigned long)dev);
+	return 0;
+}
+
+
+static int ace_close(struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct cmd cmd;
+	unsigned long flags;
+	short i;
+
+	/*
+	 * Without (or before) releasing irq and stopping hardware, this
+	 * is an absolute non-sense, by the way. It will be reset instantly
+	 * by the first irq.
+	 */
+	netif_stop_queue(dev);
+
+	
+	if (ap->promisc) {
+		cmd.evt = C_SET_PROMISC_MODE;
+		cmd.code = C_C_PROMISC_DISABLE;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+		ap->promisc = 0;
+	}
+
+	cmd.evt = C_HOST_STATE;
+	cmd.code = C_C_STACK_DOWN;
+	cmd.idx = 0;
+	ace_issue_cmd(regs, &cmd);
+
+	tasklet_kill(&ap->ace_tasklet);
+
+	/*
+	 * Make sure one CPU is not processing packets while
+	 * buffers are being released by another.
+	 */
+
+	local_irq_save(flags);
+	ace_mask_irq(dev);
+
+	for (i = 0; i < ACE_TX_RING_ENTRIES(ap); i++) {
+		struct sk_buff *skb;
+		dma_addr_t mapping;
+		struct tx_ring_info *info;
+
+		info = ap->skb->tx_skbuff + i;
+		skb = info->skb;
+		mapping = pci_unmap_addr(info, mapping);
+
+		if (mapping) {
+			if (ACE_IS_TIGON_I(ap)) {
+				struct tx_desc __iomem *tx 
+					= (struct tx_desc __iomem *) &ap->tx_ring[i];
+				writel(0, &tx->addr.addrhi);
+				writel(0, &tx->addr.addrlo);
+				writel(0, &tx->flagsize);
+			} else
+				memset(ap->tx_ring + i, 0,
+				       sizeof(struct tx_desc));
+			pci_unmap_page(ap->pdev, mapping,
+				       pci_unmap_len(info, maplen),
+				       PCI_DMA_TODEVICE);
+			pci_unmap_addr_set(info, mapping, 0);
+		}
+		if (skb) {
+			dev_kfree_skb(skb);
+			info->skb = NULL;
+		}
+	}
+
+	if (ap->jumbo) {
+		cmd.evt = C_RESET_JUMBO_RNG;
+		cmd.code = 0;
+		cmd.idx = 0;
+		ace_issue_cmd(regs, &cmd);
+	}
+
+	ace_unmask_irq(dev);
+	local_irq_restore(flags);
+
+	return 0;
+}
+
+
+static inline dma_addr_t
+ace_map_tx_skb(struct ace_private *ap, struct sk_buff *skb,
+	       struct sk_buff *tail, u32 idx)
+{
+	dma_addr_t mapping;
+	struct tx_ring_info *info;
+
+	mapping = pci_map_page(ap->pdev, virt_to_page(skb->data),
+			       offset_in_page(skb->data),
+			       skb->len, PCI_DMA_TODEVICE);
+
+	info = ap->skb->tx_skbuff + idx;
+	info->skb = tail;
+	pci_unmap_addr_set(info, mapping, mapping);
+	pci_unmap_len_set(info, maplen, skb->len);
+	return mapping;
+}
+
+
+static inline void
+ace_load_tx_bd(struct ace_private *ap, struct tx_desc *desc, u64 addr,
+	       u32 flagsize, u32 vlan_tag)
+{
+#if !USE_TX_COAL_NOW
+	flagsize &= ~BD_FLG_COAL_NOW;
+#endif
+
+	if (ACE_IS_TIGON_I(ap)) {
+		struct tx_desc __iomem *io = (struct tx_desc __iomem *) desc;
+		writel(addr >> 32, &io->addr.addrhi);
+		writel(addr & 0xffffffff, &io->addr.addrlo);
+		writel(flagsize, &io->flagsize);
+#if ACENIC_DO_VLAN
+		writel(vlan_tag, &io->vlanres);
+#endif
+	} else {
+		desc->addr.addrhi = addr >> 32;
+		desc->addr.addrlo = addr;
+		desc->flagsize = flagsize;
+#if ACENIC_DO_VLAN
+		desc->vlanres = vlan_tag;
+#endif
+	}
+}
+
+
+static int ace_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	struct tx_desc *desc;
+	u32 idx, flagsize;
+	unsigned long maxjiff = jiffies + 3*HZ;
+
+restart:
+	idx = ap->tx_prd;
+
+	if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+		goto overflow;
+
+	if (!skb_shinfo(skb)->nr_frags)	{
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, skb, idx);
+		flagsize = (skb->len << 16) | (BD_FLG_END);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+		desc = ap->tx_ring + idx;
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		/* Look at ace_tx_int for explanations. */
+		if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+			flagsize |= BD_FLG_COAL_NOW;
+
+		ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+	} else {
+		dma_addr_t mapping;
+		u32 vlan_tag = 0;
+		int i, len = 0;
+
+		mapping = ace_map_tx_skb(ap, skb, NULL, idx);
+		flagsize = (skb_headlen(skb) << 16);
+		if (skb->ip_summed == CHECKSUM_HW)
+			flagsize |= BD_FLG_TCP_UDP_SUM;
+#if ACENIC_DO_VLAN
+		if (vlan_tx_tag_present(skb)) {
+			flagsize |= BD_FLG_VLAN_TAG;
+			vlan_tag = vlan_tx_tag_get(skb);
+		}
+#endif
+
+		ace_load_tx_bd(ap, ap->tx_ring + idx, mapping, flagsize, vlan_tag);
+
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+		for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
+			skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+			struct tx_ring_info *info;
+
+			len += frag->size;
+			info = ap->skb->tx_skbuff + idx;
+			desc = ap->tx_ring + idx;
+
+			mapping = pci_map_page(ap->pdev, frag->page,
+					       frag->page_offset, frag->size,
+					       PCI_DMA_TODEVICE);
+
+			flagsize = (frag->size << 16);
+			if (skb->ip_summed == CHECKSUM_HW)
+				flagsize |= BD_FLG_TCP_UDP_SUM;
+			idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+
+			if (i == skb_shinfo(skb)->nr_frags - 1) {
+				flagsize |= BD_FLG_END;
+				if (tx_ring_full(ap, ap->tx_ret_csm, idx))
+					flagsize |= BD_FLG_COAL_NOW;
+
+				/*
+				 * Only the last fragment frees
+				 * the skb!
+				 */
+				info->skb = skb;
+			} else {
+				info->skb = NULL;
+			}
+			pci_unmap_addr_set(info, mapping, mapping);
+			pci_unmap_len_set(info, maplen, frag->size);
+			ace_load_tx_bd(ap, desc, mapping, flagsize, vlan_tag);
+		}
+	}
+
+ 	wmb();
+ 	ap->tx_prd = idx;
+ 	ace_set_txprd(regs, ap, idx);
+
+	if (flagsize & BD_FLG_COAL_NOW) {
+		netif_stop_queue(dev);
+
+		/*
+		 * A TX-descriptor producer (an IRQ) might have gotten
+		 * inbetween, making the ring free again. Since xmit is
+		 * serialized, this is the only situation we have to
+		 * re-test.
+		 */
+		if (!tx_ring_full(ap, ap->tx_ret_csm, idx))
+			netif_wake_queue(dev);
+	}
+
+	dev->trans_start = jiffies;
+	return NETDEV_TX_OK;
+
+overflow:
+	/*
+	 * This race condition is unavoidable with lock-free drivers.
+	 * We wake up the queue _before_ tx_prd is advanced, so that we can
+	 * enter hard_start_xmit too early, while tx ring still looks closed.
+	 * This happens ~1-4 times per 100000 packets, so that we can allow
+	 * to loop syncing to other CPU. Probably, we need an additional
+	 * wmb() in ace_tx_intr as well.
+	 *
+	 * Note that this race is relieved by reserving one more entry
+	 * in tx ring than it is necessary (see original non-SG driver).
+	 * However, with SG we need to reserve 2*MAX_SKB_FRAGS+1, which
+	 * is already overkill.
+	 *
+	 * Alternative is to return with 1 not throttling queue. In this
+	 * case loop becomes longer, no more useful effects.
+	 */
+	if (time_before(jiffies, maxjiff)) {
+		barrier();
+		cpu_relax();
+		goto restart;
+	}
+	
+	/* The ring is stuck full. */
+	printk(KERN_WARNING "%s: Transmit ring stuck full\n", dev->name);
+	return NETDEV_TX_BUSY;
+}
+
+
+static int ace_change_mtu(struct net_device *dev, int new_mtu)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+
+	if (new_mtu > ACE_JUMBO_MTU)
+		return -EINVAL;
+
+	writel(new_mtu + ETH_HLEN + 4, &regs->IfMtu);
+	dev->mtu = new_mtu;
+
+	if (new_mtu > ACE_STD_MTU) {
+		if (!(ap->jumbo)) {
+			printk(KERN_INFO "%s: Enabling Jumbo frame "
+			       "support\n", dev->name);
+			ap->jumbo = 1;
+			if (!test_and_set_bit(0, &ap->jumbo_refill_busy))
+				ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE);
+			ace_set_rxtx_parms(dev, 1);
+		}
+	} else {
+		while (test_and_set_bit(0, &ap->jumbo_refill_busy));
+		ace_sync_irq(dev->irq);
+		ace_set_rxtx_parms(dev, 0);
+		if (ap->jumbo) {
+			struct cmd cmd;
+
+			cmd.evt = C_RESET_JUMBO_RNG;
+			cmd.code = 0;
+			cmd.idx = 0;
+			ace_issue_cmd(regs, &cmd);
+		}
+	}
+
+	return 0;
+}
+
+static int ace_get_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link;
+
+	memset(ecmd, 0, sizeof(struct ethtool_cmd));
+	ecmd->supported =
+		(SUPPORTED_10baseT_Half | SUPPORTED_10baseT_Full |
+		 SUPPORTED_100baseT_Half | SUPPORTED_100baseT_Full |
+		 SUPPORTED_1000baseT_Half | SUPPORTED_1000baseT_Full |
+		 SUPPORTED_Autoneg | SUPPORTED_FIBRE);
+
+	ecmd->port = PORT_FIBRE;
+	ecmd->transceiver = XCVR_INTERNAL;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		ecmd->speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			ecmd->speed = SPEED_100;
+		else if (link & LNK_10MB)
+			ecmd->speed = SPEED_10;
+		else
+			ecmd->speed = 0;
+	}
+	if (link & LNK_FULL_DUPLEX)
+		ecmd->duplex = DUPLEX_FULL;
+	else
+		ecmd->duplex = DUPLEX_HALF;
+
+	if (link & LNK_NEGOTIATE)
+		ecmd->autoneg = AUTONEG_ENABLE;
+	else
+		ecmd->autoneg = AUTONEG_DISABLE;
+
+#if 0
+	/*
+	 * Current struct ethtool_cmd is insufficient
+	 */
+	ecmd->trace = readl(&regs->TuneTrace);
+
+	ecmd->txcoal = readl(&regs->TuneTxCoalTicks);
+	ecmd->rxcoal = readl(&regs->TuneRxCoalTicks);
+#endif
+	ecmd->maxtxpkt = readl(&regs->TuneMaxTxDesc);
+	ecmd->maxrxpkt = readl(&regs->TuneMaxRxDesc);
+
+	return 0;
+}
+
+static int ace_set_settings(struct net_device *dev, struct ethtool_cmd *ecmd)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 link, speed;
+
+	link = readl(&regs->GigLnkState);
+	if (link & LNK_1000MB)
+		speed = SPEED_1000;
+	else {
+		link = readl(&regs->FastLnkState);
+		if (link & LNK_100MB)
+			speed = SPEED_100;
+		else if (link & LNK_10MB)
+			speed = SPEED_10;
+		else
+			speed = SPEED_100;
+	}
+
+	link = LNK_ENABLE | LNK_1000MB | LNK_100MB | LNK_10MB |
+		LNK_RX_FLOW_CTL_Y | LNK_NEG_FCTL;
+	if (!ACE_IS_TIGON_I(ap))
+		link |= LNK_TX_FLOW_CTL_Y;
+	if (ecmd->autoneg == AUTONEG_ENABLE)
+		link |= LNK_NEGOTIATE;
+	if (ecmd->speed != speed) #ifdef DEBUG
+					printk("low on mini buffers %i\n",
+					       cur_size);
+                           			int i;
+			for (i = 0; i < RX_JUMBO_RING_ENTRIES; i++) {
+				if (ap->skb->rx_jumbo_skbuff[i].skb) {
+					ap->rx_jumbo_ring[i].size = 0;
+					set_aceaddr(&ap->rx_jumbo_ring[i].addr, 0);
+					dev_kfree_skb(ap->skb->rx_jumbo_skbuff[i].skb);
+					ap->skb->rx_jumbo_skbuff[i].skb = NULL;
+				}
+			}
+
+ 			if (ACE_IS_TIGON_I(ap)) {
+ 				struct cmd cmd;
+ 				cmd.evt = C_SET_RX_JUMBO_PRD_IDX;
+ 				cmd.code = 0;
+ 				cmd.idx = 0;
+ 				ace_issue_cmd(ap->regs, &cmd);
+ 			} else {
+ 				writel(0, &((ap->regs)->RxJumboPrd));
+ 				wmb();
+ 			}
+
+			ap->jumbo = 0;
+			ap->rx_jumbo_skbprd = 0;
+			printk(KERN_INFO "%s: Jumbo ring flushed\n",
+			       ap->name);
+			clear_bit(0, &ap->jumbo_refill_busy);
+			break;
+		}
+		default:
+			printk(KERN_ERR "%s: Unhandled event 0x%02x\n",
+			       ap->name, ap->evt_ring[evtcsm].evt);
+		}
+		evtcsm = (evtcsm + 1) % EVT_RING_ENTRIES;
+	}
+
+	return evtcsm;
+}
+
+
+static void ace_rx_int(struct net_device *dev, u32 rxretprd, u32 rxretcsm)
+{
+	struct ace_private *ap = netdev_priv(dev);
+	u32 idx;
+	int mini_count = 0, std_count = 0;
+
+	idx = rxretcsm;
+
+	prefetchw(&ap->cur_rx_bufs);
+	prefetchw(&ap->cur_mini_bufs);
+	
+	while (idx != rxretprd) {
+		struct ring_info *rip;
+		struct sk_buff *skb;
+		struct rx_desc *rxdesc, *retdesc;
+		u32 skbidx;
+		int bd_flags, desc_type, mapsize;
+		u16 csum;
+
+
+		/* make sure the rx descriptor isn't read before rxretprd */
+		if (idx == rxretcsm) 
+			rmb();
+
+		retdesc = &ap->rx_return_ring[idx];
+		skbidx = retdesc->idx;
+		bd_flags = retdesc->flags;
+		desc_type = bd_flags & (BD_FLG_JUMBO | BD_FLG_MINI);
+
+		switch(desc_type) {
+			/*
+			 * Normal frames do not have any flags set
+			 *
+			 * Mini and normal frames arrive frequently,
+			 * so use a local counter to avoid doing
+			 * atomic operations for each packet arriving.
+			 */
+		case 0:
+			rip = &ap->skb->rx_std_skbuff[skbidx];
+			mapsize = ACE_STD_BUFSIZE;
+			rxdesc = &ap->rx_std_ring[skbidx];
+			std_count++;
+			break;
+		case BD_FLG_JUMBO:
+			rip = &ap->skb->rx_jumbo_skbuff[skbidx];
+			mapsize = ACE_JUMBO_BUFSIZE;
+			rxdesc = &ap->rx_jumbo_ring[skbidx];
+			atomic_dec(&ap->cur_jumbo_bufs);
+			break;
+		case BD_FLG_MINI:
+			rip = &ap->skb->rx_mini_skbuff[skbidx];
+			mapsize = ACE_MINI_BUFSIZE;
+			rxdesc = &ap->rx_mini_ring[skbidx];
+			mini_count++; 
+			break;
+		default:
+			printk(KERN_INFO "%s: unknown frame type (0x%02x) "
+			       "returned by NIC\n", dev->name,
+			       retdesc->flags);
+			goto error;
+		}
+
+		skb = rip->skb;
+		rip->skb = NULL;
+		pci_unmap_page(ap->pdev,
+			       pci_unmap_addr(rip, mapping),
+			       mapsize,
+			       PCI_DMA_FROMDEVICE);
+		skb_put(skb, retdesc->size);
+
+		/*
+		 * Fly baby, fly!
+		 */
+		csum = retdesc->tcp_udp_csum;
+
+		skb->dev = dev;
+		skb->protocol = eth_type_trans(skb, dev);
+
+		/*
+		 * Instead of forcing the poor tigon mips cpu to calculate
+		 * pseudo hdr checksum, we do this ourselves.
+		 */
+		if (bd_flags & BD_FLG_TCP_UDP_SUM) {
+			skb->csum = htons(csum);
+			skb->ip_summed = CHECKSUM_HW;
+		} else {
+			skb->ip_summed = CHECKSUM_NONE;
+		}
+
+		/* send it up */
+#if ACENIC_DO_VLAN
+		if (ap->vlgrp && (bd_flags & BD_FLG_VLAN_TAG)) {
+			vlan_hwaccel_rx(skb, ap->vlgrp, retdesc->vlan);
+		} else
+#endif
+			netif_rx(skb);
+
+		dev->last_rx = jiffies;
+		ap->stats.rx_packets++;
+		ap->stats.rx_bytes += retdesc->size;
+
+		idx = (idx + 1) % RX_RETURN_RING_ENTRIES;
+	}
+
+	atomic_sub(std_count, &ap->cur_rx_bufs);
+	if (!ACE_IS_TIGON_I(ap))
+		atomic_sub(mini_count, &ap->cur_mini_bufs);
+
+ out:
+	/*
+	 * According to the documentation RxRetCsm is obsolete with
+	 * the 12.3.x Firmware - my Tigon I NICs seem to disagree!
+	 */
+	if (ACE_IS_TIGON_I(ap)) {
+		writel(idx, &ap->regs->RxRetCsm);
+	}
+	ap->cur_rx = idx;
+
+	return;
+ error:
+	idx = rxretprd;
+	goto out;
+}
+
+
+static inline void ace_tx_int(struct net_device *dev,
+			      u32 txcsm, u32 idx)
+{
+	struct ace_private *ap = netdev_priv(dev);
+
+	do {
+		struct sk_buff *skb;
+		dma_addr_t mapping;
+		struct tx_ring_info *info;
+
+		info = ap->skb->tx_skbuff + idx;
+		skb = info->skb;
+		mapping = pci_unmap_addr(info, mapping);
+
+		if (mapping) {
+			pci_unmap_page(ap->pdev, mapping,
+				       pci_unmap_len(info, maplen),
+				       PCI_DMA_TODEVICE);
+			pci_unmap_addr_set(info, mapping, 0);
+		}
+
+		if (skb) {
+			ap->stats.tx_packets++;
+			ap->stats.tx_bytes += skb->len;
+			dev_kfree_skb_irq(skb);
+			info->skb = NULL;
+		}
+
+		idx = (idx + 1) % ACE_TX_RING_ENTRIES(ap);
+	} while (idx != txcsm);
+
+	if (netif_queue_stopped(dev))
+		netif_wake_queue(dev);
+
+	wmb();
+	ap->tx_ret_csm = txcsm;
+
+	/* So... tx_ret_csm is advanced _after_ check for device wakeup.
+	 *
+	 * We could try to make it before. In this case we would get
+	 * the following race condition: hard_start_xmit on other cpu
+	 * enters after we advanced tx_ret_csm and fills space,
+	 * which we have just freed, so that we make illegal device wakeup.
+	 * There is no good way to workaround this (at entry
+	 * to ace_start_xmit detects this condition and prevents
+	 * ring corruption, but it is not a good workaround.)
+	 *
+	 * When tx_ret_csm is advanced after, we wake up device _only_
+	 * if we really have some space in ring (though the core doing
+	 * hard_start_xmit can see full ring for some period and has to
+	 * synchronize.) Superb.
+	 * BUT! We get another subtle race condition. hard_start_xmit
+	 * may think that ring is full between wakeup and advancing
+	 * tx_ret_csm and will stop device instantly! It is not so bad.
+	 * We are guaranteed that there is something in ring, so that
+	 * the next irq will resume transmission. To speedup this we could
+	 * mark descriptor, which closes ring with BD_FLG_COAL_NOW
+	 * (see ace_start_xmit).
+	 *
+	 * Well, this dilemma exists in all lock-free devices.
+	 * We, following scheme used in drivers by Donald Becker,
+	 * select the least dangerous.
+	 *							--ANK
+	 */
+}
+
+
+static irqreturn_t ace_interrupt(int irq, void *dev_id, struct pt_regs *ptregs)
+{
+	struct net_device *dev = (struct net_device *)dev_id;
+	struct ace_private *ap = netdev_priv(dev);
+	struct ace_regs __iomem *regs = ap->regs;
+	u32 idx;
+	u32 txcsm, rxretcsm, rxretprd;
+	u32 evtcsm, evtprd;
+
+	/*
+	 * In case of PCI shared interrupts or spurious interrupts,
+	 * we want to make sure it is actually our interrupt before
+	 * spending any time in here.
+	 */
+	if (!(readl(&regs->HostCtrl) & IN_INT))
+		return IRQ_NONE;
+
+	/*
+	 * ACK intr now. Otherwise we will lose updates to rx_ret_prd,
+	 * which happened _after_ rxretprd = *ap->rx_ret_prd; but before
+	 * writel(0, &regs->Mb0Lo).
+	 *
+	 * "IRQ avoidance" recommended in docs applies to IRQs served
+	 * threads and it is wrong even for that case.
+	 */
+	writel(0, &regs->Mb0Lo);
+	readl(&regs->Mb0Lo);
+
+	/*
+	 * There is no conflict between transmit handling in
+	 * start_xmit and receive processing, thus there is no reason
+	 * to take a spin lock for RX handling. Wait until we start
+	 * working on the other stuff - hey we don't need a spin lock
+	 * anymore.
+	 */
+	rxretprd = *ap->rx_ret_prd;
+	rxretcsm = ap->cur_rx;
+
+	if (rxretprd != rxretcsm)
+		ace_rx_int(dev, rxretprd, rxretcsm);
+
+	txcsm = *ap->tx_csm;
+	idx = ap->tx_ret_csm;
+
+	if (txcsm != idx) {
+		/*
+		 * If each skb takes only one descriptor this check degenerates
+		 * to identity, because new space has just been opened.
+		 * But if skbs are fragmented we must check that this index
+		 * update releases enough of space, otherwise we just
+		 * wait for device to make more work.
+		 */
+		if (!tx_ring_full(ap, txcsm, ap->tx_prd))
+			ace_tx_int(dev, txcsm, idx);
+	}
+
+	evtcsm = readl(&regs->EvtCsm);
+	evtprd = *ap->evt_prd;
+
+	if (evtcsm != evtprd) {
+		evtcsm = ace_handle_event(dev, evtcsm, evtprd);
+		writel(evtcsm, &regs->EvtCsm);
+	}
+
+	/*
+	 * This has to go last in the interrupt handler and run with
+	 * the spin lock released ... what lock?
+	 */
+	if (netif_running(dev)) {
+		int cur_size;
+		int run_tasklet = 0;
+
+		cur_size = atomic_read(&ap->cur_rx_bufs);
+		if (cur_size < RX_LOW_STD_THRES) {
+			if ((cur_size < RX_PANIC_STD_THRES) &&
+			    !test_and_set_bit(0, &ap->std_refill_busy)) {
+#ifdef DEBUG
+				printk("low on std buffers %i\n", cur_size);
+#endif
+				ace_load_std_rx_ring(ap,
+						     RX_RING_SIZE - cur_size);
+			} else
+				run_tasklet = 1;
+		}
+
+		if (!ACE_IS_TIGON_I(ap)) {
+			cur_size = atomic_read(&ap->cur_mini_bufs);
+			if (cur_size < RX_LOW_MINI_THRES) {
+				if ((cur_size < RX_PANIC_MINI_THRES) &&
+				    !test_and_set_bit(0,
+						      &ap->mini_refill_busy)) {
+#ifdef DEBUG
+					printk("low on mini buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_mini_rx_ring(ap, RX_MINI_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+
+		if (ap->jumbo) {
+			cur_size = atomic_read(&ap->cur_jumbo_bufs);
+			if (cur_size < RX_LOW_JUMBO_THRES) {
+				if ((cur_size < RX_PANIC_JUMBO_THRES) &&
+				    !test_and_set_bit(0,
+						      &ap->jumbo_refill_busy)){
+#ifdef DEBUG
+					printk("low on jumbo buffers %i\n",
+					       cur_size);
+#endif
+					ace_load_jumbo_rx_ring(ap, RX_JUMBO_SIZE - cur_size);
+				} else
+					run_tasklet = 1;
+			}
+		}
+		if (run_tasklet && !ap->tasklet_pending) {
+			ap->tasklet_pending = 1;
+			tasklet_schedule(&ap->ace_tasklet);
+		}
+	}
+
+	return IRQ_HANDLED;
+
