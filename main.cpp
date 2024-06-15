@@ -12,7 +12,7 @@
 #include "functions.h"
 
 int main() {
-
+/*
     HuffmanCoding huffman;
 
     std::string inputFilePath = "D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/800KB.txt";
@@ -43,9 +43,9 @@ int main() {
     cout << "Descompresion LZ completada." << endl;
 
     printSize(text, encodedText, compressedLZ);
+    */
     
-    
-    //tiempoDeCodificadoDou(20,"Tiempocodificado");
+    tiempoCodificadoDou(20,"Tiempocodificado");
 
     return 0;
 }
