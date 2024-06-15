@@ -21,8 +21,7 @@ void printSize(string text, string encodedText, const vector<Pair> &compressed){
     std::cout << "Tamano comprimido: " << compressedSize << " bits" << std::endl;
 }
 
-double tiempoDeCodificado(string filename){
-
+std::pair<double, double> tiempoCodificado(string filename) {
     auto start = chrono::high_resolution_clock::now();
 
     HuffmanCoding huffman;
@@ -32,7 +31,7 @@ double tiempoDeCodificado(string filename){
     ifstream inputFile(inputFilePath, ios::binary);
     if (!inputFile.is_open()) {
         cerr << "No se pudo abrir el archivo de entrada." << endl;
-        return 1;
+        exit(1);
     }
 
     stringstream buffer;
@@ -42,16 +41,21 @@ double tiempoDeCodificado(string filename){
 
     // Codificación Huffman
     string encodedText = huffman.codificar(text);
-    string decodedText = huffman.decodificar(encodedText);
 
     auto end = chrono::high_resolution_clock::now();
-    chrono::duration<double> duration = end - start;
+    chrono::duration<double> durationencoded = end - start;
 
-    return duration.count();
+    start = chrono::high_resolution_clock::now();
+
+    string decodedText = huffman.decodificar(encodedText);
+
+    end = chrono::high_resolution_clock::now();
+    chrono::duration<double> durationdecoded = end - start;
+
+    return {durationencoded.count(), durationdecoded.count()};
 }
 
-double tiempoDeCompresion(string filename){
-
+std::pair<double, double> tiempoCompresion(string filename) {
     auto start = chrono::high_resolution_clock::now();
 
     std::string inputFilePath = filename;
@@ -59,7 +63,7 @@ double tiempoDeCompresion(string filename){
     ifstream inputFile(inputFilePath, ios::binary);
     if (!inputFile.is_open()) {
         cerr << "No se pudo abrir el archivo de entrada." << endl;
-        return 1;
+        exit(1);
     }
 
     stringstream buffer;
@@ -69,46 +73,66 @@ double tiempoDeCompresion(string filename){
 
     // Compresión LZ
     vector<Pair> compressedLZ = compress(text);
-    string decompressedLZ = decompress(compressedLZ);
 
     auto end = chrono::high_resolution_clock::now();
-    chrono::duration<double> duration = end - start;
+    chrono::duration<double> durationcompress = end - start;
 
-    return duration.count();
+    start = chrono::high_resolution_clock::now();
+
+    string decompressedLZ = decompress(compressedLZ);
+
+    end = chrono::high_resolution_clock::now();
+    chrono::duration<double> durationdecompress = end - start;
+
+    return {durationcompress.count(), durationdecompress.count()};
 }
 
-
-
-void tiempoDeCodificadoDou(int n_tests,string file_name)
+void tiempoCodificadoDou(int n_tests,string file_name)
 {
     ofstream file_out(file_name + ".csv", ios::app);
-    file_out << "Tamaño del archivo, Tiempo" << endl;
+    file_out << "Tamaño del archivo, Tiempo de Codificacion(s), Tiempo de Decodificacion(s)" << endl;
 
-        for (int i = 0; i < n_tests; i++)
-        {
-            file_out << "100KB," << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/100KB.txt") << endl;
-            file_out << "300KB," << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/300KB.txt") << endl;
-            file_out << "500KB," << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/500KB.txt") << endl;
-            file_out << "800KB," << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/800KB.txt") << endl;
-            file_out <<  "1MB,"  << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/1MB.txt") << endl;
-        }
+        for (int i = 0; i < n_tests; i++) {
+        auto tiempos = tiempoCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/100KB.txt");
+        file_out << "100KB," << tiempos.first << "," << tiempos.second << endl;
+
+        tiempos = tiempoCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/300KB.txt");
+        file_out << "300KB," << tiempos.first << "," << tiempos.second << endl;
+
+        tiempos = tiempoCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/500KB.txt");
+        file_out << "500KB," << tiempos.first << "," << tiempos.second << endl;
+
+        tiempos = tiempoCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/800KB.txt");
+        file_out << "800KB," << tiempos.first << "," << tiempos.second << endl;
+
+        tiempos = tiempoCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/1MB.txt");
+        file_out << "1MB,"  << tiempos.first << "," << tiempos.second << endl;
+    }
 
     file_out.close();
 }
 
-void tiempoDeCompresionDou(int n_tests,string file_name)
+void tiempoCompresionDou(int n_tests,string file_name)
 {
     ofstream file_out(file_name + ".csv", ios::app);
-    file_out << "Tamaño del archivo, Tiempo" << endl;
+    file_out << "Tamaño del archivo, Tiempo de Compresion(s), Tiempo de Decompresion(s)" << endl;
 
-        for (int i = 0; i < n_tests; i++)
-        {
-            file_out << "100KB," << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/100KB.txt") << endl;
-            file_out << "300KB," << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/300KB.txt") << endl;
-            file_out << "500KB," << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/500KB.txt") << endl;
-            file_out << "800KB," << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/800KB.txt") << endl;
-            file_out <<  "1MB,"  << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/1MB.txt") << endl;
-        }
+        for (int i = 0; i < n_tests; i++) {
+        auto tiempos = tiempoCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/100KB.txt");
+        file_out << "100KB," << tiempos.first << "," << tiempos.second << endl;
+
+        tiempos = tiempoCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/300KB.txt");
+        file_out << "300KB," << tiempos.first << "," << tiempos.second << endl;
+
+        tiempos = tiempoCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/500KB.txt");
+        file_out << "500KB," << tiempos.first << "," << tiempos.second << endl;
+
+        tiempos = tiempoCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/800KB.txt");
+        file_out << "800KB," << tiempos.first << "," << tiempos.second << endl;
+
+        tiempos = tiempoCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/1MB.txt");
+        file_out << "1MB,"  << tiempos.first << "," << tiempos.second << endl;
+    }
 
     file_out.close();
 }
