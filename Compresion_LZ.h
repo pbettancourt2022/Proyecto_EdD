@@ -64,19 +64,3 @@ string decompress(const vector<Pair> &c) {
     
     return decompressed;
 }
-
-// Calcular el tamaño del texto original y el tamaño en bits cuando está comprimido
-pair<int, int> calculateSizes(const string &original, const vector<Pair> &compressed) {
-    int originalSize = original.size() * 8; // cada carácter es de 8 bits
-    int compressedSize = 0;
-    
-    for (const Pair &p : compressed) {
-        if (p.second == 0) {
-            compressedSize += 8; // carácter ASCII (8 bits)
-        } else {
-            compressedSize += 16; // posición (8 bits) + longitud (8 bits)
-        }
-    }
-    
-    return {originalSize, compressedSize};
-}

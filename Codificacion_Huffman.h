@@ -73,11 +73,6 @@ public:
         for (char c : text) {
             encodedString += codes[c];
         }
-
-        // Mostrar tamaño original y codificado
-        std::cout << "Tamano original: " << text.size() * 8 << " bits" << std::endl;
-        std::cout << "Tamano codificado: " << encodedString.size() << " bits" << std::endl;
-
         return encodedString;
     }
 
