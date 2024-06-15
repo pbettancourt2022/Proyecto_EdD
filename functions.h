@@ -2,37 +2,113 @@
 #include <fstream>
 #include <streambuf>
 #include <iostream>
+#include <chrono>
 
+void printSize(string text, string encodedText, const vector<Pair> &compressed){
 
-string readFile(const string &filename) {
-    ifstream file(filename);
-    if (!file.is_open()) {
-        cerr << "No se puede abrir el archivo: " << filename << endl;
-        exit(1);
-    }
-    string content((istreambuf_iterator<char>(file)), istreambuf_iterator<char>());
-    file.close();
-    return content;
-}
-
-void writeFile(const string &filename, const string &content) {
-    ofstream file(filename);
-    if (!file.is_open()) {
-        cerr << "No se puede escribir en el archivo: " << filename << endl;
-        exit(1);
-    }
-    file << content;
-    file.close();
-}
-
-string pairsToString(const vector<Pair> &pairs) {
-    string result;
-    for (const Pair &p : pairs) {
+    int compressedSize = 0;
+    
+    for (const Pair &p : compressed) {
         if (p.second == 0) {
-            result += "(" + string(1, char(p.first)) + ", " + to_string(p.second) + ") ";
+            compressedSize += 8; // carácter ASCII (8 bits)
         } else {
-            result += "(" + to_string(p.first) + ", " + to_string(p.second) + ") ";
+            compressedSize += 16; // posición (8 bits) + longitud (8 bits)
         }
     }
-    return result;
+
+    std::cout << "Tamano original: " << text.size() * 8 << " bits" << std::endl;
+    std::cout << "Tamano codificado: " << encodedText.size() << " bits" << std::endl;
+    std::cout << "Tamano comprimido: " << compressedSize << " bits" << std::endl;
+}
+
+double tiempoDeCodificado(string filename){
+
+    auto start = chrono::high_resolution_clock::now();
+
+    HuffmanCoding huffman;
+
+    std::string inputFilePath = filename;
+
+    ifstream inputFile(inputFilePath, ios::binary);
+    if (!inputFile.is_open()) {
+        cerr << "No se pudo abrir el archivo de entrada." << endl;
+        return 1;
+    }
+
+    stringstream buffer;
+    buffer << inputFile.rdbuf();
+    string text = buffer.str();
+    inputFile.close();
+
+    // Codificación Huffman
+    string encodedText = huffman.codificar(text);
+    string decodedText = huffman.decodificar(encodedText);
+
+    auto end = chrono::high_resolution_clock::now();
+    chrono::duration<double> duration = end - start;
+
+    return duration.count();
+}
+
+double tiempoDeCompresion(string filename){
+
+    auto start = chrono::high_resolution_clock::now();
+
+    std::string inputFilePath = filename;
+
+    ifstream inputFile(inputFilePath, ios::binary);
+    if (!inputFile.is_open()) {
+        cerr << "No se pudo abrir el archivo de entrada." << endl;
+        return 1;
+    }
+
+    stringstream buffer;
+    buffer << inputFile.rdbuf();
+    string text = buffer.str();
+    inputFile.close();
+
+    // Compresión LZ
+    vector<Pair> compressedLZ = compress(text);
+    string decompressedLZ = decompress(compressedLZ);
+
+    auto end = chrono::high_resolution_clock::now();
+    chrono::duration<double> duration = end - start;
+
+    return duration.count();
+}
+
+
+
+void tiempoDeCodificadoDou(int n_tests,string file_name)
+{
+    ofstream file_out(file_name + ".csv", ios::app);
+    file_out << "Tamaño del archivo, Tiempo" << endl;
+
+        for (int i = 0; i < n_tests; i++)
+        {
+            file_out << "100KB," << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/100KB.txt") << endl;
+            file_out << "300KB," << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/300KB.txt") << endl;
+            file_out << "500KB," << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/500KB.txt") << endl;
+            file_out << "800KB," << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/800KB.txt") << endl;
+            file_out <<  "1MB,"  << tiempoDeCodificado("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/1MB.txt") << endl;
+        }
+
+    file_out.close();
+}
+
+void tiempoDeCompresionDou(int n_tests,string file_name)
+{
+    ofstream file_out(file_name + ".csv", ios::app);
+    file_out << "Tamaño del archivo, Tiempo" << endl;
+
+        for (int i = 0; i < n_tests; i++)
+        {
+            file_out << "100KB," << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/100KB.txt") << endl;
+            file_out << "300KB," << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/300KB.txt") << endl;
+            file_out << "500KB," << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/500KB.txt") << endl;
+            file_out << "800KB," << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/800KB.txt") << endl;
+            file_out <<  "1MB,"  << tiempoDeCompresion("D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/1MB.txt") << endl;
+        }
+
+    file_out.close();
 }

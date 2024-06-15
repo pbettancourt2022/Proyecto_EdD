@@ -15,7 +15,7 @@ int main() {
 
     HuffmanCoding huffman;
 
-    std::string inputFilePath = "D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/500KB.txt";
+    std::string inputFilePath = "D:/Joako/Desktop/Archivos de la U/Estructura de datos/Proyecto_EdD/800KB.txt";
 
     ifstream inputFile(inputFilePath, ios::binary);
     if (!inputFile.is_open()) {
@@ -29,30 +29,23 @@ int main() {
     inputFile.close();
 
     // Codificación Huffman
-    cout << "Iniciando codificación Huffman..." << endl;
+    cout << "Iniciando codificacion Huffman..." << endl;
     string encodedText = huffman.codificar(text);
-    cout << "Codificación Huffman completada." << endl;
+    cout << "Codificacion Huffman completada." << endl;
     string decodedText = huffman.decodificar(encodedText);
-    cout << "Decodificación Huffman completada." << endl;
-
-    // Escribir resultados en archivos
-    writeFile("decoded.txt", decodedText);
-    
-    writeFile("encoded.txt", encodedText);
+    cout << "Decodificacion Huffman completada." << endl;
 
     // Compresión LZ
-    cout << "Iniciando compresión LZ..." << endl;
+    cout << "Iniciando compresion LZ..." << endl;
     vector<Pair> compressedLZ = compress(text);
-    cout << "Compresión LZ completada." << endl;
+    cout << "Compresion LZ completada." << endl;
     string decompressedLZ = decompress(compressedLZ);
-    cout << "Descompresión LZ completada." << endl;
+    cout << "Descompresion LZ completada." << endl;
 
-    auto sizesLZ = calculateSizes(text, compressedLZ);
-    cout << "LZ - Tamaño original: " << sizesLZ.first << " bits, Tamaño comprimido: " << sizesLZ.second << " bits" << endl;
-
-    // Guardar el texto descomprimido LZ
-    writeFile("decompressedLZ.txt", decompressedLZ);
-    writeFile("compressedLZ.txt", pairsToString(compressedLZ));
+    printSize(text, encodedText, compressedLZ);
+    
+    
+    //tiempoDeCodificadoDou(20,"Tiempocodificado");
 
     return 0;
 }

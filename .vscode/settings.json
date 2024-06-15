@@ -48,6 +48,11 @@
         "fstream": "cpp",
         "sstream": "cpp",
         "optional": "cpp",
-        "ranges": "cpp"
+        "ranges": "cpp",
+        "chrono": "cpp",
+        "ctime": "cpp",
+        "unordered_set": "cpp",
+        "ratio": "cpp",
+        "variant": "cpp"
     }
 }
