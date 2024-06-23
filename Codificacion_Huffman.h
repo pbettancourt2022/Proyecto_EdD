@@ -4,7 +4,7 @@
 #include <vector>
 #include <bitset>
 
-// Estructura para los nodos del árbol de Huffman
+// Estructura para los nodos del árbol de Huffman o.0
 struct HuffmanNode {
     char data;
     unsigned freq;
