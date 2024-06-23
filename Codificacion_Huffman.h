@@ -11,8 +11,7 @@ struct HuffmanNode {
     HuffmanNode* left;
     HuffmanNode* right;
     /**
-     * Constructor de un nodo de Huffman.
-     * 
+     * @brief Constructor de un nodo de Huffman.
      * @param data Carácter que el nodo representa.
      * @param freq Frecuencia de aparición del carácter.
      */
@@ -21,8 +20,7 @@ struct HuffmanNode {
 // Estructura que define un functor para comparar dos nodos de Huffman por su frecuencia.
 struct Compare {
     /**
-     * Functor que realiza la comparación.
-     *
+     * @brief Functor que realiza la comparación.
      * @param l Puntero al primer nodo de Huffman.
      * @param r Puntero al segundo nodo de Huffman.
      * @return True si la frecuencia de h1 es mayor a la de h2, false en caso contrario.
@@ -32,11 +30,16 @@ struct Compare {
     }
 };
 
+// Clase para la codificación y decodificación utilizando el algoritmo de Huffman.
 class HuffmanCoding {
     HuffmanNode* root;
     std::unordered_map<char, std::string> codes;
     std::unordered_map<std::string, char> reverseCodes;
-
+    /**
+     * @brief Función recursiva para construir los códigos binarios de Huffman.
+     * @param node Nodo actual en el árbol de Huffman.
+     * @param str Cadena de ceros y unos acumulada para el código binario del camino actual.
+     */
     void buildCodes(HuffmanNode* node, std::string str) {
         if (!node) return;
 
@@ -48,7 +51,11 @@ class HuffmanCoding {
         buildCodes(node->left, str + "0");
         buildCodes(node->right, str + "1");
     }
-
+    /**
+     * @brief Función que construye el árbol de Huffman basado en las frecuencias de los caracteres.
+     * @param freqMap Mapa que contiene las frecuencias de los caracteres en el texto.
+     * @return Puntero a la raíz del árbol de Huffman construido.
+     */
     HuffmanNode* buildTree(std::unordered_map<char, unsigned> freqMap) {
         std::priority_queue<HuffmanNode*, std::vector<HuffmanNode*>, Compare> minHeap;
 
@@ -68,10 +75,14 @@ class HuffmanCoding {
 
         return minHeap.top();
     }
-
+// Constructor de clases de codificación de Huffman.
 public:
     HuffmanCoding() : root(nullptr) {}
-
+    /**
+     * @brief Función que codifica una cadena de texto utilizando el algoritmo de Huffman.
+     * @param text Cadena de texto sin codificar.
+     * @return La cadena codificada usando el algoritmo de Huffman.
+     */
     std::string codificar(const std::string& text) {
         std::unordered_map<char, unsigned> freqMap;
         for (char c : text) {
@@ -87,7 +98,11 @@ public:
         }
         return encodedString;
     }
-
+    /**
+     * @brief Función que decodifica una cadena codificada utilizando el algoritmo de Huffman.
+     * @param text Cadena codificada.
+     * @return La cadena de texto sin codificar.
+     */
     std::string decodificar(const std::string& encodedText) {
         std::string decodedString;
         std::string currentCode;
