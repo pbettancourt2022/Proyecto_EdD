@@ -4,19 +4,31 @@
 #include <vector>
 #include <bitset>
 
-// Estructura para los nodos del árbol de Huffman o.0
+// Estructura para representar un nodo en un árbol de Huffman.
 struct HuffmanNode {
     char data;
     unsigned freq;
     HuffmanNode* left;
     HuffmanNode* right;
-
+    /**
+     * Constructor de un nodo de Huffman.
+     * 
+     * @param data Carácter que el nodo representa.
+     * @param freq Frecuencia de aparición del carácter.
+     */
     HuffmanNode(char data, unsigned freq) : data(data), freq(freq), left(nullptr), right(nullptr) {}
 };
-
+// Estructura que define un functor para comparar dos nodos de Huffman por su frecuencia.
 struct Compare {
-    bool operator()(HuffmanNode* l, HuffmanNode* r) {
-        return (l->freq > r->freq);
+    /**
+     * Functor que realiza la comparación.
+     *
+     * @param l Puntero al primer nodo de Huffman.
+     * @param r Puntero al segundo nodo de Huffman.
+     * @return True si la frecuencia de h1 es mayor a la de h2, false en caso contrario.
+     */
+    bool operator()(HuffmanNode* hl, HuffmanNode* h2) {
+        return (hl->freq > h2->freq);
     }
 };
 
