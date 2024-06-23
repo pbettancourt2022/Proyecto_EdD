@@ -7,13 +7,16 @@
 using namespace std;
 
 typedef pair<int, int> Pair;
-
-// Función para encontrar la coincidencia más larga del substring en la ventana
+/**
+ * @brief Encuentra la coincidencia más larga en una cadena de texto.
+ * @param s La cadena en la que se busca la coincidencia.
+ * @param currentPosition La posición actual dentro de la cadena donde se está buscando la coincidencia.
+ * @return Dos enteros que representan la posición y longitud de la coincidencia más larga.
+ */
 Pair findLongestMatch(const string &s, int currentPosition) {
     int maxMatchLength = 0;
     int matchPosition = 0;
 
-    // Ventana deslizante para encontrar la coincidencia más larga
     for (int i = 0; i < currentPosition; ++i) {
         int length = 0;
         while (s[i + length] == s[currentPosition + length] && (currentPosition + length) < s.size()) {
@@ -27,7 +30,11 @@ Pair findLongestMatch(const string &s, int currentPosition) {
     return {matchPosition, maxMatchLength};
 }
 
-// Comprimir el texto usando compresión LZ
+/**
+ * @brief Comprime una cadena de texto utilizando el algoritmo de compresión LZ
+ * @param t La cadena de texto que se desea comprimir.
+ * @return Un vector de pares que representa la versión comprimida de la cadena de texto `t`.
+ */
 vector<Pair> compress(const string &t) {
     vector<Pair> compressed;
     int i = 0;
@@ -47,7 +54,11 @@ vector<Pair> compress(const string &t) {
     return compressed;
 }
 
-// Descomprimir la secuencia de pares para obtener el texto original
+/**
+ * @brief Descomprime una secuencia de pares para obtener el texto original.
+ * @param c Vector de pares que representa la versión comprimida del texto.
+ * @return El texto original descomprimido.
+ */
 string decompress(const vector<Pair> &c) {
     string decompressed;
     
