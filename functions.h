@@ -3,7 +3,12 @@
 #include <streambuf>
 #include <iostream>
 #include <chrono>
-
+/**
+ * @brief Imprime los tamaños en bits del texto original, texto codificado y datos comprimidos. 
+ * @param text La cadena de texto original.
+ * @param encodedText La cadena de texto codificada.
+ * @param compressed Vector de pares que representa la versión comprimida del texto.
+ */
 void printSize(string text, string encodedText, const vector<Pair> &compressed){
 
     int compressedSize = 0;
@@ -20,7 +25,11 @@ void printSize(string text, string encodedText, const vector<Pair> &compressed){
     std::cout << "Tamano codificado: " << encodedText.size() << " bits" << std::endl;
     std::cout << "Tamano comprimido: " << compressedSize << " bits" << std::endl;
 }
-
+/**
+ * @brief Método para medir el tiempo de ejecución para codificar y decodificar un archivo usando Huffman.
+ * @param filename Nombre del archivo que se va a leer y procesar.
+ * @return Un par de valores double que representan los tiempos de codificación y decodificación en segundos.
+ */
 std::pair<double, double> tiempoCodificado(string filename) {
     auto start = chrono::high_resolution_clock::now();
 
@@ -54,7 +63,11 @@ std::pair<double, double> tiempoCodificado(string filename) {
 
     return {durationencoded.count(), durationdecoded.count()};
 }
-
+/**
+ * @brief Método para medir el tiempo de ejecución para comprimir y descomprimir un archivo usando LZ.
+ * @param filename Nombre del archivo que se va a leer y procesar.
+ * @return Un par de valores double que representan los tiempos de compresión y descompresión en segundos.
+ */
 std::pair<double, double> tiempoCompresion(string filename) {
     auto start = chrono::high_resolution_clock::now();
 
@@ -86,7 +99,11 @@ std::pair<double, double> tiempoCompresion(string filename) {
 
     return {durationcompress.count(), durationdecompress.count()};
 }
-
+/**
+ * @brief Realiza múltiples pruebas de codificación y decodificación de archivos de diferentes tamaños, registrando los tiempos en un archivo CSV.
+ * @param n_tests Número de pruebas que se van a realizar.
+ * @param file_name Nombre base del archivo CSV que se creará para registrar los tiempos.
+ */
 void tiempoCodificadoDou(int n_tests,string file_name)
 {
     ofstream file_out(file_name + ".csv", ios::app);
@@ -111,7 +128,11 @@ void tiempoCodificadoDou(int n_tests,string file_name)
 
     file_out.close();
 }
-
+/**
+ * @brief Realiza múltiples pruebas de compresión y decompresión de archivos de diferentes tamaños, registrando los tiempos en un archivo CSV.
+ * @param n_tests Número de pruebas que se van a realizar.
+ * @param file_name Nombre base del archivo CSV que se creará para registrar los tiempos.
+ */
 void tiempoCompresionDou(int n_tests,string file_name)
 {
     ofstream file_out(file_name + ".csv", ios::app);

@@ -53,6 +53,10 @@
         "ctime": "cpp",
         "unordered_set": "cpp",
         "ratio": "cpp",
-        "variant": "cpp"
+        "variant": "cpp",
+        "charconv": "cpp",
+        "format": "cpp",
+        "iomanip": "cpp",
+        "span": "cpp"
     }
 }
